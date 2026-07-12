@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+optika_track_record.db
+.DS_Store
+.venv/
+venv/
