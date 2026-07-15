@@ -44,14 +44,6 @@ try:
 except ImportError:
     HAS_XGB = False
 
-# --- Auto device theme detection ---
-try:
-    from streamlit_theme import st_theme
-    _theme = st_theme(key="qe_theme")
-    DARK = (_theme or {}).get("base", "dark") == "dark"
-except Exception:
-    DARK = True
-
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -78,31 +70,7 @@ PALETTE = {
     "border":    "#1f2937",
 }
 
-PLOTLY_TEMPLATE = "plotly_dark" if DARK else "plotly"
-
-if DARK:
-    UI = {"bg1":"#0b0f1a","bg2":"#0f1729","surface":"#151b2b","surface2":"#1a2138",
-          "border":"#1f2937","text":"#f1f5f9","text2":"#e2e8f0","muted":"#94a3b8",
-          "muted2":"#64748b","violet":"#a78bfa","cyan_soft":"#67e8f9",
-          "grid":"rgba(148,163,184,0.1)","zero":"rgba(148,163,184,0.2)",
-          "input":"rgba(21,27,43,0.8)","radio":"rgba(21,27,43,0.5)",
-          "plot_bg":"rgba(21,27,43,0.5)",
-          "b_live":"#6ee7b7","b_del":"#fcd34d","b_nse":"#fdba74","b_syn":"#cbd5e1"}
-else:
-    UI = {"bg1":"#f6f8fc","bg2":"#ecf1f9","surface":"#ffffff","surface2":"#eef2fa",
-          "border":"#dde3ee","text":"#0f172a","text2":"#1e293b","muted":"#475569",
-          "muted2":"#64748b","violet":"#6d28d9","cyan_soft":"#0e7490",
-          "grid":"rgba(15,23,42,0.06)","zero":"rgba(15,23,42,0.15)",
-          "input":"rgba(255,255,255,0.9)","radio":"rgba(255,255,255,0.7)",
-          "plot_bg":"rgba(255,255,255,0.5)",
-          "b_live":"#047857","b_del":"#b45309","b_nse":"#c2410c","b_syn":"#475569"}
-
-TXT  = UI["text"]
-MUT  = UI["muted"]
-SURF = UI["surface"]
-BORD = UI["border"]
-MARK = "#0b0f1a" if DARK else "#ffffff"   # marker outline
-
+PLOTLY_TEMPLATE = "plotly_dark"
 
 POPULAR_TICKERS = [
     ("RELIANCE.NS", "Reliance Industries (RELIANCE.NS) — NSE"),
@@ -1407,20 +1375,28 @@ def build_professional_report(rd):
 # =============================================================================
 
 def apply_pro_style(fig, title="", height=400, show_legend=True):
-    template = "plotly_dark" if DARK else "plotly_white"
-    text = "#e2e8f0" if DARK else "#0f172a"
-    grid = "rgba(148,163,184,0.15)" if DARK else "rgba(148,163,184,0.25)"
+    """Style a Plotly figure while staying theme-agnostic.
+
+    Colors are intentionally left to Streamlit's native theming
+    (see st.plotly_chart(..., theme="streamlit") calls below), which
+    automatically adapts to the user's light/dark mode. We only set
+    structural properties here (height, margins, transparent backgrounds)
+    so the chart blends into the surrounding app regardless of theme.
+    """
     fig.update_layout(
-        template=template, height=height,
-        title=dict(text=title, font=dict(size=14, color=text), x=0.02),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Inter", size=11, color=text),
-        xaxis=dict(gridcolor=grid, zerolinecolor=grid),
-        yaxis=dict(gridcolor=grid, zerolinecolor=grid),
+        height=height,
+        title=dict(text=title, x=0.02),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="right", x=1,
+            bgcolor="rgba(0,0,0,0)",
+        ) if show_legend else dict(),
         margin=dict(l=50, r=30, t=60, b=50),
-        legend=dict(orientation="h", y=1.02, x=1, xanchor="right") if show_legend else dict(),
     )
     return fig
+
 # =============================================================================
 # STREAMLIT UI — QUANT EDGE
 # =============================================================================
@@ -1431,81 +1407,202 @@ st.set_page_config(
     page_icon="📊",
     initial_sidebar_state="expanded",
 )
-<style>         
-:root {
-  ...everything until...
-</style>         
 
-
+# Theme-adaptive CSS — follows the device/browser's light or dark mode
+# preference automatically via `prefers-color-scheme`, and also respects
+# Streamlit's own theme variables so it stays correct if the user manually
+# overrides the theme from Settings.
 st.markdown("""
 <style>
+/* ---- Design tokens (dark default) ---- */
 :root {
-  --bg-1:#f8fafc; --bg-2:#eef2ff; --surface:#ffffff; --surface-2:#f1f5f9;
-  --border:#e2e8f0; --text-primary:#0f172a; --text-secondary:#475569; --text-muted:#94a3b8;
-  --violet:#6d28d9; --cyan-soft:#0e7490;
-  --b-live:#047857; --b-del:#b45309; --b-nse:#c2410c; --b-syn:#475569;
-  --shadow:0 1px 3px rgba(0,0,0,0.08);
+    --qe-bg-1: #0b0f1a;
+    --qe-bg-2: #0f1729;
+    --qe-surface-1: #151b2b;
+    --qe-surface-2: #1a2138;
+    --qe-border: #1f2937;
+    --qe-text-heading: #e2e8f0;
+    --qe-text-primary: #f1f5f9;
+    --qe-text-secondary: #94a3b8;
+    --qe-text-muted: #64748b;
+    --qe-accent: #a78bfa;
+    --qe-accent-2: #67e8f9;
 }
+
+/* ---- Light-mode overrides (device/browser preference) ---- */
+@media (prefers-color-scheme: light) {
+    :root {
+        --qe-bg-1: #f8fafc;
+        --qe-bg-2: #eef2f9;
+        --qe-surface-1: #ffffff;
+        --qe-surface-2: #f1f5f9;
+        --qe-border: #e2e8f0;
+        --qe-text-heading: #0f172a;
+        --qe-text-primary: #1e293b;
+        --qe-text-secondary: #475569;
+        --qe-text-muted: #64748b;
+        --qe-accent: #7c3aed;
+        --qe-accent-2: #0891b2;
+    }
+}
+
+/* Global */
+.stApp {
+    background: linear-gradient(180deg, var(--qe-bg-1) 0%, var(--qe-bg-2) 100%);
+}
+.main .block-container {
+    padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1600px;
+}
+
+/* Brand */
+.qe-brand {
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 0 16px 0; border-bottom: 1px solid var(--qe-border); margin-bottom: 16px;
+}
+.qe-logo {
+    font-size: 1.9rem; font-weight: 900; letter-spacing: -0.5px;
+    background: linear-gradient(135deg, #6366f1 0%, #22d3ee 50%, #10b981 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    line-height: 1;
+}
+.qe-tagline {
+    color: var(--qe-text-muted); font-size: 0.72rem; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 1.5px; margin-top: 4px;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, var(--qe-bg-2) 0%, var(--qe-bg-1) 100%);
+    border-right: 1px solid var(--qe-border);
+}
+[data-testid="stSidebar"] .stMarkdown h3 {
+    color: var(--qe-accent); font-size: 0.75rem; text-transform: uppercase;
+    letter-spacing: 1.5px; font-weight: 700; margin-top: 20px; margin-bottom: 8px;
+    border-left: 3px solid #6366f1; padding-left: 8px;
+}
+
+/* Ensure the sidebar open/close control is always visible, including on
+   mobile where the sidebar starts collapsed behind a hamburger icon. */
+[data-testid="collapsedControl"], [data-testid="stSidebarCollapsedControl"] {
+    visibility: visible !important;
+    display: flex !important;
+}
+
+/* Metrics */
+[data-testid="stMetric"] {
+    background: linear-gradient(135deg, var(--qe-surface-1) 0%, var(--qe-surface-2) 100%);
+    padding: 14px 16px; border-radius: 10px;
+    border: 1px solid var(--qe-border);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+    transition: transform 0.2s, border-color 0.2s;
+}
+[data-testid="stMetric"]:hover {
+    transform: translateY(-2px); border-color: #6366f1;
+}
+[data-testid="stMetricLabel"] {
+    color: var(--qe-text-secondary) !important; font-size: 0.7rem !important;
+    text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600;
+}
+[data-testid="stMetricValue"] {
+    color: var(--qe-text-primary) !important; font-size: 1.35rem !important; font-weight: 700 !important;
+}
+[data-testid="stMetricDelta"] { font-size: 0.75rem !important; font-weight: 600; }
+
+/* Buttons */
+.stButton > button {
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+    border: none; color: white; font-weight: 600;
+    padding: 10px 24px; border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(99,102,241,0.3);
+    transition: all 0.2s;
+}
+.stButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(99,102,241,0.5);
+}
+
+/* Section headers */
+.qe-section {
+    background: linear-gradient(90deg, rgba(99,102,241,0.15) 0%, transparent 100%);
+    border-left: 4px solid #6366f1; padding: 12px 16px;
+    margin: 16px 0 12px 0; border-radius: 4px;
+    font-weight: 700; font-size: 1.1rem; color: var(--qe-text-heading);
+}
+
+/* Cards (feature tiles, signal cards, etc.) */
+.qe-card {
+    background: linear-gradient(135deg, var(--qe-surface-1), var(--qe-surface-2));
+    border: 1px solid var(--qe-border);
+    border-radius: 12px;
+}
+.qe-card-title { color: var(--qe-accent); }
+.qe-card-title-cyan { color: var(--qe-accent-2); }
+.qe-card-body { color: var(--qe-text-secondary); }
+.qe-card-heading { color: var(--qe-text-primary); }
+
+/* Badges */
+.qe-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 10px; border-radius: 12px; font-size: 0.7rem;
+    font-weight: 600; margin: 2px 4px 2px 0;
+}
+.badge-live { background: rgba(16,185,129,0.15); color: #059669; border: 1px solid #10b981; }
+.badge-delayed { background: rgba(245,158,11,0.15); color: #b45309; border: 1px solid #f59e0b; }
+.badge-nse { background: rgba(249,115,22,0.15); color: #c2410c; border: 1px solid #f97316; }
+.badge-synth { background: rgba(107,114,128,0.15); color: var(--qe-text-secondary); border: 1px solid #6b7280; }
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg-1:#0b0f1a; --bg-2:#0f1729; --surface:#151b2b; --surface-2:#1a2138;
-    --border:#1f2937; --text-primary:#f1f5f9; --text-secondary:#94a3b8; --text-muted:#64748b;
-    --violet:#a78bfa; --cyan-soft:#67e8f9;
-    --b-live:#6ee7b7; --b-del:#fcd34d; --b-nse:#fdba74; --b-syn:#cbd5e1;
-    --shadow:0 1px 3px rgba(0,0,0,0.3);
-  }
+    .badge-live { color: #6ee7b7; }
+    .badge-delayed { color: #fcd34d; }
+    .badge-nse { color: #fdba74; }
 }
-.stApp { background: linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%); }
-.main .block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1600px; }
 
-[data-testid="stSidebar"] { background: var(--bg-1) !important; border-right: 1px solid var(--border); }
-[data-testid="stSidebar"] h3 { color: var(--violet); font-size: 0.75rem; text-transform: uppercase;
-  letter-spacing: 1.5px; border-left: 3px solid #6366f1; padding-left: 8px; }
+/* Dataframe */
+[data-testid="stDataFrame"] {
+    border: 1px solid var(--qe-border); border-radius: 8px; overflow: hidden;
+}
 
-/* Hide chrome but KEEP header — the sidebar '>' toggle lives there */
+/* Radio (nav) */
+[data-testid="stSidebar"] [role="radiogroup"] label {
+    background: rgba(148,163,184,0.08); border: 1px solid var(--qe-border);
+    padding: 10px 14px; border-radius: 8px; margin: 3px 0;
+    transition: all 0.15s; width: 100%;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {
+    background: rgba(99,102,241,0.1); border-color: #6366f1;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label[data-checked="true"] {
+    background: linear-gradient(90deg, rgba(99,102,241,0.3), rgba(99,102,241,0.05));
+    border-color: #6366f1; box-shadow: 0 0 0 1px #6366f1;
+}
+
+/* Input */
+.stTextInput input, .stNumberInput input, .stSelectbox > div > div {
+    background: var(--qe-surface-1) !important;
+    border: 1px solid var(--qe-border) !important;
+    color: var(--qe-text-primary) !important;
+}
+
+/* Info/warning boxes */
+.stAlert {
+    background: var(--qe-surface-1) !important;
+    border: 1px solid var(--qe-border) !important;
+    border-left: 4px solid #6366f1 !important;
+}
+
+/* Divider */
+hr { border-color: var(--qe-border) !important; margin: 20px 0 !important; }
+
+/* Hide Streamlit branding chrome (menu + footer) without hiding the
+   header bar itself, since the header holds the sidebar toggle that
+   mobile/narrow-viewport users need to open the left navigation panel. */
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
-header[data-testid="stHeader"] { background: rgba(0,0,0,0); }
 
-.qe-brand { display:flex; gap:12px; padding:0 0 16px 0; border-bottom:1px solid var(--border); margin-bottom:16px; }
-.qe-logo { font-size:1.9rem; font-weight:900; letter-spacing:-0.5px;
-  background:linear-gradient(135deg,#6366f1 0%,#22d3ee 50%,#10b981 100%);
-  -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-.qe-tagline { color:var(--text-muted); font-size:0.72rem; text-transform:uppercase; letter-spacing:1.5px; }
-
-[data-testid="stMetric"] { background:var(--surface) !important; border:1px solid var(--border) !important;
-  border-radius:10px; box-shadow:var(--shadow); }
-[data-testid="stMetricLabel"] { color:var(--text-secondary) !important; font-size:0.7rem !important;
-  text-transform:uppercase; letter-spacing:0.8px; }
-[data-testid="stMetricValue"] { color:var(--text-primary) !important; font-weight:700 !important; }
-
-.qe-section { background:linear-gradient(90deg, rgba(99,102,241,0.15) 0%, transparent 100%);
-  border-left:4px solid #6366f1; padding:12px 16px; margin:16px 0; border-radius:4px;
-  font-weight:700; color:var(--text-primary); }
-
-.qe-badge { display:inline-flex; padding:3px 10px; border-radius:12px; font-size:0.7rem; font-weight:600; margin:2px; }
-.badge-live    { background:rgba(16,185,129,0.15); color:var(--b-live); border:1px solid #10b981; }
-.badge-delayed { background:rgba(245,158,11,0.15); color:var(--b-del);  border:1px solid #f59e0b; }
-.badge-nse     { background:rgba(249,115,22,0.15); color:var(--b-nse);  border:1px solid #f97316; }
-.badge-synth   { background:rgba(107,114,128,0.15); color:var(--b-syn); border:1px solid #6b7280; }
-
-.qe-card { background:linear-gradient(135deg, var(--surface), var(--surface-2));
-  border:1px solid var(--border); border-radius:12px; padding:24px 20px; text-align:center; height:160px; }
-.qe-card .t { color:var(--violet); font-weight:700; font-size:0.95rem; margin-bottom:8px; }
-.qe-card .d { color:var(--text-secondary); font-size:0.78rem; }
-.qe-signal { background:linear-gradient(135deg, var(--surface), var(--surface-2));
-  border:1px solid var(--border); border-radius:8px; padding:20px; }
-.qe-signal .lbl { font-size:0.75rem; font-weight:700; text-transform:uppercase;
-  letter-spacing:1px; margin-bottom:8px; }
-.qe-signal .verdict { color:var(--text-primary); font-size:1.2rem; font-weight:700; margin-bottom:12px; }
-.qe-signal .notes { color:var(--text-secondary); font-size:0.85rem; line-height:1.5; }
-.qe-hero h2 { color:var(--text-primary); font-weight:700; }
-.qe-hero p { color:var(--text-secondary); font-size:1.05rem; max-width:600px; margin:20px auto; }
-
-.stTextInput input, .stNumberInput input, .stSelectbox > div > div {
-  background: var(--surface) !important; border:1px solid var(--border) !important; color: var(--text-primary) !important; }
-
-hr { border-color: var(--border) !important; margin:20px 0 !important; }
+/* Hide the "Manage app" / Deploy button and related toolbar actions
+   (Streamlit Cloud viewer chrome) without touching the sidebar toggle. */
+.stAppDeployButton, .stDeployButton { display: none !important; }
+[data-testid="stToolbarActions"] { display: none !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1530,13 +1627,13 @@ with st.sidebar:
     # Brand
     st.markdown("""
     <div style="text-align:center; padding: 8px 0 16px 0;
-                 border-bottom: 1px solid #1f2937; margin-bottom: 12px;">
+                 border-bottom: 1px solid var(--qe-border); margin-bottom: 12px;">
       <div style="font-size: 1.6rem; font-weight: 900; letter-spacing: -0.5px;
                    background: linear-gradient(135deg, #6366f1, #22d3ee, #10b981);
                    -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
         📊 QUANT EDGE
       </div>
-      <div style="color: #64748b; font-size: 0.65rem; text-transform: uppercase;
+      <div style="color: var(--qe-text-muted); font-size: 0.65rem; text-transform: uppercase;
                    letter-spacing: 1.2px; margin-top: 4px;">
         DERIVATIVES ANALYTICS
       </div>
@@ -1629,8 +1726,8 @@ if not (run_btn or raw_query) or not ticker_input:
     st.markdown("""
     <div style="text-align: center; padding: 60px 20px;">
       <div style="font-size: 4rem; margin-bottom: 20px;">📊</div>
-      <h2 style="color: #e2e8f0; font-weight: 700;">Welcome to QUANT EDGE</h2>
-      <p style="color: #94a3b8; font-size: 1.05rem; max-width: 600px; margin: 20px auto;">
+      <h2 style="color: var(--qe-text-heading); font-weight: 700;">Welcome to QUANT EDGE</h2>
+      <p style="color: var(--qe-text-secondary); font-size: 1.05rem; max-width: 600px; margin: 20px auto;">
         Institutional-grade derivatives analytics with real-time multi-source data,
         advanced pricing models, and comprehensive risk analysis.
       </p>
@@ -1645,13 +1742,11 @@ if not (run_btn or raw_query) or not ticker_input:
         ("🛡️", "Full Risk Suite", "Greeks · VaR/CVaR · Stress · Backtest"),
     ]):
         col.markdown(f"""
-        <div style="background: linear-gradient(135deg, #151b2b, #1a2138);
-                     border: 1px solid #1f2937; border-radius: 12px;
-                     padding: 24px 20px; text-align: center; height: 160px;">
+        <div class="qe-card" style="padding: 24px 20px; text-align: center; height: 160px;">
           <div style="font-size: 2.2rem; margin-bottom: 8px;">{icon}</div>
-          <div style="color: #a78bfa; font-weight: 700; font-size: 0.95rem;
+          <div class="qe-card-title" style="font-weight: 700; font-size: 0.95rem;
                        margin-bottom: 8px;">{title}</div>
-          <div style="color: #94a3b8; font-size: 0.78rem;">{desc}</div>
+          <div class="qe-card-body" style="font-size: 0.78rem;">{desc}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1815,7 +1910,7 @@ if section == "🎯 Overview":
     fig_px.add_trace(go.Scatter(x=hist.index, y=hist["ma200"], name="MA 200",
                                   line=dict(color=PALETTE["danger"], width=1.5, dash="dash")))
     apply_pro_style(fig_px, f"{ticker_input} — Price History with Moving Averages", 420)
-    st.plotly_chart(fig_px, use_container_width=True)
+    st.plotly_chart(fig_px, use_container_width=True, theme="streamlit")
 
     # Signals
     ov, on_notes, _ = rec_options(iv, g_vol if not np.isnan(g_vol) else e_vol,
@@ -1826,34 +1921,30 @@ if section == "🎯 Overview":
     sig_c1, sig_c2 = st.columns(2)
     with sig_c1:
         st.markdown(f"""
-        <div style="background: linear-gradient(135deg, #151b2b, #1a2138);
-                     border: 1px solid #1f2937; border-left: 4px solid #6366f1;
-                     border-radius: 8px; padding: 20px;">
-          <div style="color: #a78bfa; font-size: 0.75rem; font-weight: 700;
+        <div class="qe-card" style="border-left: 4px solid #6366f1; padding: 20px;">
+          <div class="qe-card-title" style="font-size: 0.75rem; font-weight: 700;
                        text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">
             📊 OPTIONS
           </div>
-          <div style="color: #f1f5f9; font-size: 1.2rem; font-weight: 700; margin-bottom: 12px;">
+          <div class="qe-card-heading" style="font-size: 1.2rem; font-weight: 700; margin-bottom: 12px;">
             {ov}
           </div>
-          <div style="color: #94a3b8; font-size: 0.85rem; line-height: 1.5;">
+          <div class="qe-card-body" style="font-size: 0.85rem; line-height: 1.5;">
             {"<br>• ".join([""] + on_notes)}
           </div>
         </div>
         """, unsafe_allow_html=True)
     with sig_c2:
         st.markdown(f"""
-        <div style="background: linear-gradient(135deg, #151b2b, #1a2138);
-                     border: 1px solid #1f2937; border-left: 4px solid #22d3ee;
-                     border-radius: 8px; padding: 20px;">
-          <div style="color: #67e8f9; font-size: 0.75rem; font-weight: 700;
+        <div class="qe-card" style="border-left: 4px solid #22d3ee; padding: 20px;">
+          <div class="qe-card-title-cyan" style="font-size: 0.75rem; font-weight: 700;
                        text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">
             📦 FUTURES
           </div>
-          <div style="color: #f1f5f9; font-size: 1.2rem; font-weight: 700; margin-bottom: 12px;">
+          <div class="qe-card-heading" style="font-size: 1.2rem; font-weight: 700; margin-bottom: 12px;">
             {fv_sig}
           </div>
-          <div style="color: #94a3b8; font-size: 0.85rem; line-height: 1.5;">
+          <div class="qe-card-body" style="font-size: 0.85rem; line-height: 1.5;">
             {"<br>• ".join([""] + fn_notes)}
           </div>
         </div>
@@ -1905,7 +1996,7 @@ elif section == "📊 Pricing & Volatility":
                           annotation_font=dict(color=PALETTE["danger"]))
     fig_v.update_yaxes(tickformat=".0%")
     apply_pro_style(fig_v, "Realized vs Implied Volatility", 420)
-    st.plotly_chart(fig_v, use_container_width=True)
+    st.plotly_chart(fig_v, use_container_width=True, theme="streamlit")
 
     st.markdown("### Option Pricing — Multi-Model Comparison")
     if is_synth:
@@ -1931,15 +2022,14 @@ elif section == "📊 Pricing & Volatility":
     fig_b.add_trace(go.Bar(
         x=mnames, y=mprices, marker=dict(color=colors, line=dict(color="#0b0f1a", width=1)),
         text=[f"{ccy}{v:.4f}" for v in mprices], textposition="outside",
-        textfont=dict(size=11, color="#f1f5f9"),
         hovertemplate="<b>%{x}</b><br>Price: %{text}<extra></extra>",
     ))
     if not np.isnan(market_price):
-        fig_b.add_hline(y=float(market_price), line_dash="dash", line_color="#f1f5f9",
+        fig_b.add_hline(y=float(market_price), line_dash="dash",
                          annotation_text="Market Mid", annotation_position="right")
     apply_pro_style(fig_b, "Pricing Model Comparison", 400, show_legend=False)
     fig_b.update_yaxes(title_text=f"Price ({ccy})")
-    st.plotly_chart(fig_b, use_container_width=True)
+    st.plotly_chart(fig_b, use_container_width=True, theme="streamlit")
 
     # IV Smile
     if not chain.empty:
@@ -1959,8 +2049,7 @@ elif section == "📊 Pricing & Volatility":
             fig_sm.add_trace(go.Scatter(
                 x=sdf["moneyness"], y=sdf["iv"], mode="lines+markers", name="IV",
                 line=dict(color=PALETTE["primary"], width=2.5),
-                marker=dict(size=8, color=PALETTE["primary"],
-                             line=dict(color="#0b0f1a", width=1))
+                marker=dict(size=8, color=PALETTE["primary"])
             ), secondary_y=False)
             fig_sm.add_trace(go.Bar(
                 x=sdf["moneyness"], y=sdf["oi"], name="Open Interest",
@@ -1972,7 +2061,7 @@ elif section == "📊 Pricing & Volatility":
             fig_sm.update_yaxes(title_text="Open Interest", secondary_y=True)
             fig_sm.update_xaxes(title_text="Moneyness (K/S)")
             apply_pro_style(fig_sm, "IV Smile with Open Interest Overlay", 420)
-            st.plotly_chart(fig_sm, use_container_width=True)
+            st.plotly_chart(fig_sm, use_container_width=True, theme="streamlit")
 
 elif section == "🏛️ Greeks":
     st.markdown('<div class="qe-section">🏛️ Risk Sensitivities (Greeks)</div>',
@@ -2008,10 +2097,10 @@ elif section == "🏛️ Greeks":
         fig_gk.add_trace(go.Scatter(x=sr_range, y=arr, line=dict(color=col, width=2.5),
                                      fill="tozeroy", fillcolor=col.replace(")",",0.1)").replace("rgb","rgba"),
                                      showlegend=False), row=r_, col=c_)
-        fig_gk.add_vline(x=float(spot), line_dash="dash", line_color="#f1f5f9",
+        fig_gk.add_vline(x=float(spot), line_dash="dash",
                           opacity=0.5, row=r_, col=c_)
     apply_pro_style(fig_gk, "Greeks vs Spot Price", 550, show_legend=False)
-    st.plotly_chart(fig_gk, use_container_width=True)
+    st.plotly_chart(fig_gk, use_container_width=True, theme="streamlit")
 
 elif section == "🌐 Volatility Surface":
     st.markdown('<div class="qe-section">🌐 Volatility Surface</div>', unsafe_allow_html=True)
@@ -2039,13 +2128,12 @@ elif section == "🌐 Volatility Surface":
             colorbar=dict(title="IV", tickformat=".0%", thickness=15, len=0.75),
             hovertemplate="Strike: %{x}<br>Expiry: %{y}<br>IV: %{z:.2%}<extra></extra>",
         ))
-        fig_sf.add_vline(x=closest, line_dash="dash", line_color="#f1f5f9",
-                          annotation_text=f"K={strike:.0f}",
-                          annotation_font=dict(color="#f1f5f9"))
+        fig_sf.add_vline(x=closest, line_dash="dash",
+                          annotation_text=f"K={strike:.0f}")
         fig_sf.update_xaxes(title="Strike")
         fig_sf.update_yaxes(title="Expiry")
         apply_pro_style(fig_sf, "Implied Volatility Surface", 480, show_legend=False)
-        st.plotly_chart(fig_sf, use_container_width=True)
+        st.plotly_chart(fig_sf, use_container_width=True, theme="streamlit")
 
         # Term structure
         st.markdown("### ATM Volatility Term Structure")
@@ -2072,8 +2160,7 @@ elif section == "🌐 Volatility Surface":
             fig_ts.add_trace(go.Scatter(
                 x=tdf["days"], y=tdf["atm_iv"], mode="lines+markers",
                 line=dict(color=PALETTE["primary"], width=3),
-                marker=dict(size=12, color=PALETTE["primary"],
-                             line=dict(color="#0b0f1a", width=2)),
+                marker=dict(size=12, color=PALETTE["primary"]),
                 fill="tozeroy", fillcolor="rgba(99,102,241,0.1)",
                 hovertemplate="Days: %{x:.0f}<br>ATM IV: %{y:.2%}<extra></extra>",
             ))
@@ -2084,7 +2171,7 @@ elif section == "🌐 Volatility Surface":
             fig_ts.update_yaxes(title="ATM Implied Vol", tickformat=".0%")
             fig_ts.update_xaxes(title="Days to Expiry")
             apply_pro_style(fig_ts, "ATM IV Term Structure", 380, show_legend=False)
-            st.plotly_chart(fig_ts, use_container_width=True)
+            st.plotly_chart(fig_ts, use_container_width=True, theme="streamlit")
 
 elif section == "🔮 Forecasting":
     st.markdown('<div class="qe-section">🔮 Volatility Forecasting Models</div>',
@@ -2107,13 +2194,12 @@ elif section == "🔮 Forecasting":
             x=list(fc_valid.keys()), y=list(fc_valid.values()),
             marker=dict(color=[PALETTE["primary"], PALETTE["secondary"],
                                  PALETTE["success"], PALETTE["warning"],
-                                 PALETTE["accent"], PALETTE["danger"]][:len(fc_valid)],
-                         line=dict(color="#0b0f1a", width=1)),
+                                 PALETTE["accent"], PALETTE["danger"]][:len(fc_valid)]),
             text=[f"{v:.1%}" for v in fc_valid.values()], textposition="outside",
         ))
         fig_fc.update_yaxes(tickformat=".0%", title="Annualised Vol")
         apply_pro_style(fig_fc, "Volatility Forecast — Cross-Model Comparison", 380, show_legend=False)
-        st.plotly_chart(fig_fc, use_container_width=True)
+        st.plotly_chart(fig_fc, use_container_width=True, theme="streamlit")
 
     # GARCH conditional vol
     if HAS_ARCH and len(hist["log_return"].dropna()) > 100:
@@ -2130,7 +2216,7 @@ elif section == "🔮 Forecasting":
             ))
             fig_g.update_yaxes(tickformat=".0%")
             apply_pro_style(fig_g, "GARCH(1,1) Historical Conditional Volatility", 380, show_legend=False)
-            st.plotly_chart(fig_g, use_container_width=True)
+            st.plotly_chart(fig_g, use_container_width=True, theme="streamlit")
             st.caption(f"**Model parameters:** ω={gf.params.get('omega',0):.2e}, "
                         f"α={gf.params.get('alpha[1]',0):.4f}, "
                         f"β={gf.params.get('beta[1]',0):.4f}, "
@@ -2144,8 +2230,7 @@ elif section == "🔮 Forecasting":
     fig_r = go.Figure()
     fig_r.add_trace(go.Histogram(
         x=ret_c, nbinsx=80, histnorm="probability density",
-        marker=dict(color=PALETTE["primary"], opacity=0.6,
-                     line=dict(color="#0b0f1a", width=0.5)),
+        marker=dict(color=PALETTE["primary"], opacity=0.6),
         name="Observed"
     ))
     xr = np.linspace(ret_c.min(), ret_c.max(), 200)
@@ -2156,7 +2241,7 @@ elif section == "🔮 Forecasting":
     fig_r.update_xaxes(title="Log Return")
     fig_r.update_yaxes(title="Density")
     apply_pro_style(fig_r, "Return Distribution vs Normal", 380)
-    st.plotly_chart(fig_r, use_container_width=True)
+    st.plotly_chart(fig_r, use_container_width=True, theme="streamlit")
 
     # Skew/kurtosis
     skew = ret_c.skew(); kurt = ret_c.kurtosis()
@@ -2197,7 +2282,7 @@ elif section == "🎨 Strategies":
                                  line=dict(width=0), name="Loss zone", showlegend=False))
     fig_p.add_trace(go.Scatter(x=sr2, y=pnl2, mode="lines", name="P&L",
                                  line=dict(color=PALETTE["primary"], width=3)))
-    fig_p.add_hline(y=0.0, line_color="#f1f5f9", line_dash="dash", opacity=0.5)
+    fig_p.add_hline(y=0.0, line_dash="dash", opacity=0.5)
     fig_p.add_vline(x=float(spot), line_color=PALETTE["warning"], line_dash="dot",
                      annotation_text="Spot")
     for be in bes:
@@ -2206,7 +2291,7 @@ elif section == "🎨 Strategies":
     fig_p.update_xaxes(title=f"Spot at Expiry ({ccy})")
     fig_p.update_yaxes(title=f"P&L ({ccy})")
     apply_pro_style(fig_p, f"{sname} — Payoff at Expiry", 480)
-    st.plotly_chart(fig_p, use_container_width=True)
+    st.plotly_chart(fig_p, use_container_width=True, theme="streamlit")
 
 elif section == "🛡️ Hedging":
     st.markdown('<div class="qe-section">🛡️ Delta-Hedge Simulation</div>', unsafe_allow_html=True)
@@ -2231,7 +2316,7 @@ elif section == "🛡️ Hedging":
                                  fill="tozeroy", fillcolor="rgba(16,185,129,0.1)",
                                  showlegend=False), row=2, col=1)
     apply_pro_style(fig_h, "Delta-Hedge Path Simulation", 480, show_legend=False)
-    st.plotly_chart(fig_h, use_container_width=True)
+    st.plotly_chart(fig_h, use_container_width=True, theme="streamlit")
 
     # Multi-path distribution
     st.markdown("### 100-Path Hedge P&L Distribution")
@@ -2244,15 +2329,14 @@ elif section == "🛡️ Hedging":
     parr = np.array(pnls)
     fig_pd = go.Figure()
     fig_pd.add_trace(go.Histogram(x=parr, nbinsx=30,
-                                    marker=dict(color=PALETTE["primary"], opacity=0.7,
-                                                 line=dict(color="#0b0f1a", width=1))))
-    fig_pd.add_vline(x=0.0, line_dash="dash", line_color="#f1f5f9")
+                                    marker=dict(color=PALETTE["primary"], opacity=0.7)))
+    fig_pd.add_vline(x=0.0, line_dash="dash")
     fig_pd.add_vline(x=float(parr.mean()), line_color=PALETTE["warning"], line_dash="dot",
                       annotation_text=f"Mean {ccy}{parr.mean():.2f}")
     fig_pd.update_xaxes(title=f"P&L ({ccy})")
     fig_pd.update_yaxes(title="Frequency")
     apply_pro_style(fig_pd, "Hedge P&L Distribution (100 GBM paths)", 380, show_legend=False)
-    st.plotly_chart(fig_pd, use_container_width=True)
+    st.plotly_chart(fig_pd, use_container_width=True, theme="streamlit")
 
     dc1, dc2, dc3, dc4 = st.columns(4)
     dc1.metric("Mean", f"{ccy}{parr.mean():.4f}")
@@ -2279,10 +2363,9 @@ elif section == "📦 Futures":
     fig_fc.add_trace(go.Scatter(x=(tenors*252).astype(int).tolist(), y=fwds,
                                   mode="lines+markers",
                                   line=dict(color=PALETTE["primary"], width=3),
-                                  marker=dict(size=10, color=PALETTE["primary"],
-                                                line=dict(color="#0b0f1a", width=2)),
+                                  marker=dict(size=10, color=PALETTE["primary"]),
                                   fill="tozeroy", fillcolor="rgba(99,102,241,0.1)"))
-    fig_fc.add_hline(y=float(spot), line_dash="dot", line_color=PALETTE["muted"],
+    fig_fc.add_hline(y=float(spot), line_dash="dot",
                       annotation_text=f"Spot {ccy}{spot:.2f}")
     if mkt_fut > 0:
         fig_fc.add_hline(y=float(mkt_fut), line_dash="dash", line_color=PALETTE["danger"],
@@ -2290,7 +2373,7 @@ elif section == "📦 Futures":
     fig_fc.update_xaxes(title="Days to Expiry")
     fig_fc.update_yaxes(title=f"Forward Price ({ccy})")
     apply_pro_style(fig_fc, "Cost-of-Carry Forward Curve", 380, show_legend=False)
-    st.plotly_chart(fig_fc, use_container_width=True)
+    st.plotly_chart(fig_fc, use_container_width=True, theme="streamlit")
 
     ov, on_notes, _ = rec_options(iv, g_vol if not np.isnan(g_vol) else e_vol,
                                      h_vol, trend, strike/spot, int(tau*365), pcr_oi)
@@ -2327,14 +2410,13 @@ elif section == "⚠️ Risk":
     fig_st = go.Figure(go.Bar(
         y=sdf["Scenario"], x=sdf["Exact P&L"], orientation="h",
         marker=dict(color=[PALETTE["success"] if v > 0 else PALETTE["danger"]
-                            for v in sdf["Exact P&L"]],
-                     line=dict(color="#0b0f1a", width=1)),
+                            for v in sdf["Exact P&L"]]),
         text=[f"{ccy}{v:+.2f}" for v in sdf["Exact P&L"]], textposition="outside",
     ))
-    fig_st.add_vline(x=0.0, line_color="#f1f5f9", line_dash="dash", opacity=0.5)
+    fig_st.add_vline(x=0.0, line_dash="dash", opacity=0.5)
     fig_st.update_xaxes(title=f"P&L ({ccy})")
     apply_pro_style(fig_st, "Option P&L Under Stress Scenarios", 480, show_legend=False)
-    st.plotly_chart(fig_st, use_container_width=True)
+    st.plotly_chart(fig_st, use_container_width=True, theme="streamlit")
 
     st.dataframe(sdf, use_container_width=True, hide_index=True)
 
@@ -2373,26 +2455,24 @@ elif section == "🔁 Backtest":
             x=[f"W{int(r)}" for r in btdf["window"]],
             y=btdf["approx_pnl"],
             marker=dict(color=[PALETTE["success"] if v > 0 else PALETTE["danger"]
-                                 for v in btdf["approx_pnl"]],
-                         line=dict(color="#0b0f1a", width=1)),
+                                 for v in btdf["approx_pnl"]]),
             text=[f"{v:+.4f}" for v in btdf["approx_pnl"]], textposition="outside"
         ))
-        fig_bt.add_hline(y=0.0, line_color="#f1f5f9", line_dash="dash", opacity=0.5)
+        fig_bt.add_hline(y=0.0, line_dash="dash", opacity=0.5)
         apply_pro_style(fig_bt, "Walk-Forward P&L by Window", 380, show_legend=False)
-        st.plotly_chart(fig_bt, use_container_width=True)
+        st.plotly_chart(fig_bt, use_container_width=True, theme="streamlit")
 
         btdf["cum_pnl"] = btdf["approx_pnl"].cumsum()
         fig_cum = go.Figure()
         fig_cum.add_trace(go.Scatter(
             x=btdf["window"], y=btdf["cum_pnl"], mode="lines+markers",
             line=dict(color=PALETTE["primary"], width=3),
-            marker=dict(size=12, color=PALETTE["primary"],
-                         line=dict(color="#0b0f1a", width=2)),
+            marker=dict(size=12, color=PALETTE["primary"]),
             fill="tozeroy", fillcolor="rgba(99,102,241,0.15)",
         ))
-        fig_cum.add_hline(y=0.0, line_color="#f1f5f9", line_dash="dash", opacity=0.5)
+        fig_cum.add_hline(y=0.0, line_dash="dash", opacity=0.5)
         apply_pro_style(fig_cum, "Cumulative Backtest P&L", 320, show_legend=False)
-        st.plotly_chart(fig_cum, use_container_width=True)
+        st.plotly_chart(fig_cum, use_container_width=True, theme="streamlit")
 
 elif section == "📋 Report":
     st.markdown('<div class="qe-section">📋 Comprehensive Analysis Report</div>',
