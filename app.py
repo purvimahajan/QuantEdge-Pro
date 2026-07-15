@@ -1,53 +1,36 @@
 """
-Optika — Derivatives Intelligence Engine
-====================================================================
-Search any stock (name or ticker, including NSE-listed Indian equities),
-and this engine will:
-  1. pull live spot/rate/dividend/options-chain data (Yahoo Finance,
-     with NSE India and Stooq as automatic fallbacks)
-  2. estimate volatility: historical, EWMA, GARCH, ML-forecast (Random
-     Forest), model-free (VIX-style) implied vol, and a full 3D vol surface
-  3. price options 3 classical ways (BSM, binomial tree, Monte Carlo) plus
-     2 advanced stochastic models (Heston stochastic vol, Merton jump-diffusion)
-  4. compute first- AND second-order Greeks (delta/gamma/vega/theta/rho,
-     vanna/volga/charm), aggregate them across a multi-leg strategy, and
-     simulate dynamic delta-hedging
-  5. build and visualize multi-leg option strategies (straddles, spreads,
-     condors, butterflies) with payoff diagrams
-  6. quantify risk: parametric & historical VaR/CVaR, scenario stress tests
-  7. backtest a volatility trading signal historically with walk-forward
-     validation and full performance stats (Sharpe, Sortino, Calmar, drawdown)
-  8. check futures/forward fair value via cost-of-carry
-  9. log every recommendation to a local track record so you can see how
-     the engine's own calls would have played out
-  10. produce transparent, rule-based OPTIONS and FUTURES trade signals
-
-Run with:
-    pip install -r requirements.txt
-    streamlit run app.py
-
-NOTE ON DATA: this is "on-demand live" analysis (refreshed each time you
-run it), not tick-level real-time streaming. Yahoo Finance is the primary
-source; for NSE-listed Indian equities where Yahoo's feed is thin or
-unavailable, the engine automatically falls back to NSE India's public API,
-and then to Stooq, for historical prices. Every recommendation is a
-transparent, rule-based educational signal — NOT financial advice.
+╔══════════════════════════════════════════════════════════════════════════╗
+║                                                                          ║
+║   ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗████████╗    ███████╗██████╗  ██████╗ ███████╗
+║  ██╔═══██╗██║   ██║██╔══██╗████╗  ██║╚══██╔══╝    ██╔════╝██╔══██╗██╔════╝ ██╔════╝
+║  ██║   ██║██║   ██║███████║██╔██╗ ██║   ██║       █████╗  ██║  ██║██║  ███╗█████╗
+║  ██║▄▄ ██║██║   ██║██╔══██║██║╚██╗██║   ██║       ██╔══╝  ██║  ██║██║   ██║██╔══╝
+║  ╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║       ███████╗██████╔╝╚██████╔╝███████╗
+║   ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝       ╚══════╝╚═════╝  ╚═════╝ ╚══════╝
+║                                                                          ║
+║              QUANT EDGE — Institutional Derivatives Analytics           ║
+║              Multi-Source Real-Time · Advanced Pricing · Risk           ║
+╚══════════════════════════════════════════════════════════════════════════╝
 """
 
-import sqlite3
 import warnings
+warnings.filterwarnings("ignore")
+
+import io, json, math, sqlite3, time, re
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 import yfinance as yf
-import plotly.graph_objects as go
+from scipy.optimize import brentq, minimize
 from scipy.stats import norm
-from scipy.optimize import brentq
-
-warnings.filterwarnings("ignore")
+from scipy.integrate import quad
 
 try:
     from arch import arch_model
@@ -56,1955 +39,2437 @@ except ImportError:
     HAS_ARCH = False
 
 try:
-    from sklearn.ensemble import RandomForestRegressor
-    HAS_SKLEARN = True
+    import xgboost as xgb
+    HAS_XGB = True
 except ImportError:
-    HAS_SKLEARN = False
-
+    HAS_XGB = False
 
 # =============================================================================
-# 0. TICKER SEARCH (company name -> ticker symbol)
+# CONFIGURATION
 # =============================================================================
 
-COMMON_NAME_MAP = {
-    "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL", "alphabet": "GOOGL",
-    "amazon": "AMZN", "tesla": "TSLA", "meta": "META", "facebook": "META",
-    "netflix": "NFLX", "nvidia": "NVDA", "amd": "AMD", "intel": "INTC",
-    "s&p 500": "^GSPC", "sp500": "^GSPC", "nasdaq": "^IXIC", "dow jones": "^DJI",
-    "spy": "SPY", "gold": "GC=F", "crude oil": "CL=F", "bitcoin": "BTC-USD",
-    "berkshire": "BRK-B", "jpmorgan": "JPM", "jp morgan": "JPM", "visa": "V",
-    "walmart": "WMT", "disney": "DIS", "coca cola": "KO", "coca-cola": "KO",
-    "reliance": "RELIANCE.NS", "reliance industries": "RELIANCE.NS",
-    "tata motors": "TATAMOTORS.NS", "infosys": "INFY.NS",
-    "icici bank": "ICICIBANK.NS", "hdfc bank": "HDFCBANK.NS", "tcs": "TCS.NS",
-    "tata consultancy": "TCS.NS", "sbi": "SBIN.NS", "state bank of india": "SBIN.NS",
-    "wipro": "WIPRO.NS", "nifty": "^NSEI", "nifty 50": "^NSEI", "sensex": "^BSESN",
-    "bank nifty": "^NSEBANK", "adani": "ADANIENT.NS", "adani enterprises": "ADANIENT.NS",
-    "bajaj finance": "BAJFINANCE.NS", "bajaj auto": "BAJAJ-AUTO.NS", "itc": "ITC.NS",
-    "larsen": "LT.NS", "l&t": "LT.NS", "maruti": "MARUTI.NS", "maruti suzuki": "MARUTI.NS",
-    "axis bank": "AXISBANK.NS", "kotak": "KOTAKBANK.NS", "kotak bank": "KOTAKBANK.NS",
-    "hindustan unilever": "HINDUNILVR.NS", "hul": "HINDUNILVR.NS",
-    "bharti airtel": "BHARTIARTL.NS", "airtel": "BHARTIARTL.NS",
-    "hcl tech": "HCLTECH.NS", "hcl technologies": "HCLTECH.NS",
-    "tech mahindra": "TECHM.NS", "sun pharma": "SUNPHARMA.NS",
-    "titan": "TITAN.NS", "asian paints": "ASIANPAINT.NS", "ultratech": "ULTRACEMCO.NS",
-    "nestle india": "NESTLEIND.NS", "ntpc": "NTPC.NS", "ongc": "ONGC.NS",
-    "power grid": "POWERGRID.NS", "coal india": "COALINDIA.NS", "hindalco": "HINDALCO.NS",
-    "cipla": "CIPLA.NS", "dr reddy": "DRREDDY.NS", "grasim": "GRASIM.NS",
-    "eicher motors": "EICHERMOT.NS", "britannia": "BRITANNIA.NS", "divis lab": "DIVISLAB.NS",
-    "shree cement": "SHREECEM.NS", "hero motocorp": "HEROMOTOCO.NS",
+DB_PATH = Path("quant_edge.db")
+
+CURRENCY_SYMBOLS = {
+    "USD":"$","INR":"₹","GBP":"£","EUR":"€","JPY":"¥",
+    "HKD":"HK$","CAD":"C$","AUD":"A$","CNY":"¥","SGD":"S$",
+    "CHF":"CHF ","KRW":"₩",
 }
 
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def search_ticker(query: str):
-    """
-    Resolve a free-text query (company name OR ticker) into a list of
-    (symbol, display_name) candidates. Curated matches (esp. major Indian
-    large-caps) are checked FIRST and always ranked at the top, since
-    Yahoo's fuzzy search can otherwise match a generic word like "Reliance"
-    to an unrelated NYSE small-cap instead of Reliance Industries. Yahoo
-    Finance search results are appended after as additional options, then
-    a raw-ticker guess as the final fallback.
-    """
-    query = query.strip()
-    if not query:
-        return []
-
-    results = []
-    key = query.lower()
-
-    # 1. Curated matches first (highest priority, always shown first)
-    seen_symbols = set()
-    for name, symbol in COMMON_NAME_MAP.items():
-        if key == name or key in name or name in key:
-            if symbol not in seen_symbols:
-                results.append((symbol, f"✓ {name.title()} ({symbol})"))
-                seen_symbols.add(symbol)
-
-    # 2. Yahoo Finance live search, appended after curated matches
-    try:
-        resp = requests.get(
-            "https://query2.finance.yahoo.com/v1/finance/search",
-            params={"q": query, "quotesCount": 8, "newsCount": 0},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5,
-        )
-        data = resp.json()
-        for q in data.get("quotes", []):
-            symbol = q.get("symbol")
-            name = q.get("shortname") or q.get("longname") or symbol
-            exch = q.get("exchDisp", "")
-            if symbol and symbol not in seen_symbols:
-                results.append((symbol, f"{name} ({symbol}) — {exch}"))
-                seen_symbols.add(symbol)
-    except Exception:
-        pass
-
-    # 3. Last resort: treat the raw query as a ticker
-    if not results:
-        guess = query.upper().replace(" ", "")
-        results.append((guess, f"{guess} (unverified — typed as-is)"))
-
-    return results
-
-
-# =============================================================================
-# 1. DATA LAYER — multi-source: Yahoo Finance -> NSE India -> Stooq
-# =============================================================================
-
-def _nse_session(symbol: str = ""):
-    """
-    NSE India's API blocks bare requests without a realistic browser session.
-    The reliable pattern (used by most NSE-scraping libraries) is:
-      1. Hit the homepage to get initial cookies
-      2. Hit the actual option-chain/quote PAGE (not the API) for the
-         symbol-specific cookies NSE's bot-detection expects
-      3. Only then call the JSON API endpoint
-    Even with this, NSE may still block requests from outside India or from
-    cloud/datacenter IPs -- that's a real limitation of the free public
-    source, not something headers alone can always fix.
-    """
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-    try:
-        s.get("https://www.nseindia.com", timeout=6)
-        page = "option-chain" if not symbol else f"get-quotes/equity?symbol={symbol}"
-        s.headers["Referer"] = "https://www.nseindia.com/"
-        s.get(f"https://www.nseindia.com/{page}", timeout=6)
-    except Exception:
-        pass
-    return s
-
-
-def _nse_response_status(r) -> str:
-    """Classifies an NSE response as OK / blocked / empty, since a 200 status can still be a block page."""
-    if r.status_code in (401, 403, 429):
-        return "blocked_status"
-    ctype = r.headers.get("Content-Type", "")
-    if "json" not in ctype.lower() or r.text.strip().startswith(("<", "<!DOCTYPE")):
-        return "blocked_html"  # got a webpage/challenge instead of JSON -> bot-blocked
-    return "ok"
-
-
-def fetch_nse_quote(symbol: str):
-    """Live quote fallback from NSE India for a bare symbol (no .NS suffix)."""
-    try:
-        s = _nse_session(symbol)
-        r = s.get(f"https://www.nseindia.com/api/quote-equity?symbol={symbol}", timeout=6)
-        if _nse_response_status(r) != "ok":
-            return None
-        data = r.json()
-        price = data.get("priceInfo", {}).get("lastPrice")
-        return float(price) if price else None
-    except Exception:
-        return None
-
-
-def fetch_nse_history(symbol: str, days: int = 730):
-    """Historical daily closes fallback from NSE India (bare symbol, no .NS)."""
-    try:
-        s = _nse_session(symbol)
-        to_date = datetime.now()
-        from_date = to_date - timedelta(days=days)
-        url = (f"https://www.nseindia.com/api/historical/cm/equity?symbol={symbol}"
-               f"&series=[%22EQ%22]&from={from_date.strftime('%d-%m-%Y')}&to={to_date.strftime('%d-%m-%Y')}")
-        r = s.get(url, timeout=8)
-        if _nse_response_status(r) != "ok":
-            return None
-        data = r.json().get("data", [])
-        if not data:
-            return None
-        rows = [{"Date": pd.to_datetime(d["CH_TIMESTAMP"]), "Close": float(d["CH_CLOSING_PRICE"])} for d in data]
-        df = pd.DataFrame(rows).sort_values("Date").set_index("Date")
-        df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
-        return df
-    except Exception:
-        return None
-
-
-def fetch_nse_option_chain(symbol: str):
-    """
-    Live option chain fallback from NSE India for F&O-eligible symbols.
-    Returns (chain_df, expiry_dates, status_note) -- status_note always
-    tells the truth about WHY it failed (blocked vs genuinely no contracts)
-    rather than guessing.
-    """
-    try:
-        s = _nse_session(symbol)
-        r = s.get(f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}", timeout=8)
-        status = _nse_response_status(r)
-        if status == "blocked_status":
-            return pd.DataFrame(), [], (f"NSE India returned HTTP {r.status_code} — the request was blocked "
-                                         f"(common when calling from outside India or from a cloud/hosted IP)")
-        if status == "blocked_html":
-            return pd.DataFrame(), [], ("NSE India returned a webpage instead of data — its bot-detection "
-                                         "blocked this request. This is a known limitation of NSE's free public "
-                                         "API when accessed programmatically; it isn't specific to this stock.")
-        data = r.json()
-        records = data.get("records", {}).get("data", [])
-        if not records:
-            return pd.DataFrame(), [], (f"NSE responded but returned no contract data for '{symbol}' — "
-                                         f"either it genuinely has no F&O listing, or NSE served a partial/"
-                                         f"empty response (try again in a moment).")
-        rows = []
-        expiry_dates = data.get("records", {}).get("expiryDates", [])
-        for rec in records:
-            for side in ("CE", "PE"):
-                leg = rec.get(side)
-                if leg:
-                    rows.append({
-                        "strike": leg.get("strikePrice"),
-                        "lastPrice": leg.get("lastPrice", 0),
-                        "bid": leg.get("bidprice", 0),
-                        "ask": leg.get("askPrice", 0),
-                        "volume": leg.get("totalTradedVolume", 0),
-                        "openInterest": leg.get("openInterest", 0),
-                        "expiry": leg.get("expiryDate"),
-                        "type": "call" if side == "CE" else "put",
-                    })
-        return pd.DataFrame(rows), expiry_dates, "OK"
-    except Exception as e:
-        return pd.DataFrame(), [], f"NSE India request failed ({type(e).__name__}) — likely blocked or unreachable from this network"
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_stooq_history(ticker: str):
-    """Generic fallback for historical daily prices (best coverage for US/global tickers)."""
-    try:
-        sym = ticker.lower()
-        if "." not in sym and not sym.startswith("^"):
-            sym = sym + ".us"
-        url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-        df = pd.read_csv(url)
-        if df is None or df.empty or "Close" not in df.columns:
-            return None
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.set_index("Date").sort_index()
-        df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
-        return df
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_spot_and_history(ticker: str, period: str = "2y"):
-    """
-    Tries Yahoo Finance first (broadest coverage + options data). If that
-    fails or returns empty (common for some NSE tickers), falls back to
-    NSE India directly (for .NS symbols), then to Stooq as a last resort.
-    Returns (spot, history_df, source_label).
-    """
-    try:
-        hist = yf.Ticker(ticker).history(period=period, auto_adjust=True)
-        if not hist.empty:
-            hist = hist.copy()
-            hist["log_return"] = np.log(hist["Close"] / hist["Close"].shift(1))
-            return float(hist["Close"].iloc[-1]), hist, "Yahoo Finance"
-    except Exception:
-        pass
-
-    if ticker.upper().endswith(".NS"):
-        bare = ticker.upper().replace(".NS", "")
-        nse_hist = fetch_nse_history(bare)
-        if nse_hist is not None and not nse_hist.empty:
-            return float(nse_hist["Close"].iloc[-1]), nse_hist, "NSE India (fallback)"
-
-    stooq_hist = fetch_stooq_history(ticker)
-    if stooq_hist is not None and not stooq_hist.empty:
-        return float(stooq_hist["Close"].iloc[-1]), stooq_hist, "Stooq (fallback)"
-
-    return None, None, None
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_risk_free_rate(ticker: str = "") -> float:
-    """13-week T-bill (^IRX) for USD instruments; India 91-day T-bill proxy for .NS tickers."""
-    try:
-        if ticker.upper().endswith(".NS") or ticker.upper() in ("^NSEI", "^NSEBANK", "^BSESN"):
-            return 0.065  # approximate Indian short-term risk-free rate proxy
-        irx = yf.Ticker("^IRX").history(period="5d")
-        rate = float(irx["Close"].iloc[-1]) / 100.0
-        if rate <= 0 or rate > 0.25:
-            return 0.045
-        return rate
-    except Exception:
-        return 0.045
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_dividend_yield(ticker: str, spot: float) -> float:
-    """Computed from trailing dividend rate / spot for reliability across exchanges."""
-    try:
-        info = yf.Ticker(ticker).info
-        rate = info.get("trailingAnnualDividendRate")
-        if rate and spot:
-            dy = rate / spot
-            if 0 <= dy < 0.5:
-                return dy
-        dy = info.get("dividendYield")
-        if dy is None:
-            return 0.0
-        dy = dy if dy < 1 else dy / 100.0
-        return dy if dy <= 0.5 else 0.0
-    except Exception:
-        return 0.0
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_currency_symbol(ticker: str) -> str:
-    symbols = {
-        "USD": "$", "INR": "₹", "GBP": "£", "EUR": "€", "JPY": "¥",
-        "HKD": "HK$", "CAD": "C$", "AUD": "A$", "CNY": "¥", "SGD": "S$",
-        "CHF": "CHF ", "KRW": "₩",
-    }
-    if ticker.upper().endswith(".NS") or ticker.upper().endswith(".BO"):
-        return "₹"
-    try:
-        code = yf.Ticker(ticker).info.get("currency", "USD")
-        return symbols.get(code, code + " ")
-    except Exception:
-        return "$"
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_expiries(ticker: str):
-    """Tries Yahoo first; falls back to NSE India's option chain expiry list for .NS symbols. Returns (expiries, source, note)."""
-    try:
-        exp = list(yf.Ticker(ticker).options)
-        if exp:
-            return exp, "Yahoo Finance", "OK"
-    except Exception:
-        pass
-    if ticker.upper().endswith(".NS"):
-        bare = ticker.upper().replace(".NS", "")
-        _, expiry_dates, note = fetch_nse_option_chain(bare)
-        if expiry_dates:
-            return expiry_dates, "NSE India (fallback)", "OK"
-        return [], None, f"Yahoo Finance doesn't carry NSE options data (expected). NSE fallback: {note}"
-    return [], None, "Yahoo Finance has no listed options for this ticker"
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_options_chain(ticker: str, expiry: str, source: str = "Yahoo Finance"):
-    if source == "NSE India (fallback)":
-        bare = ticker.upper().replace(".NS", "")
-        full_chain, _, _ = fetch_nse_option_chain(bare)
-        if full_chain.empty:
-            return pd.DataFrame()
-        return full_chain[full_chain["expiry"] == expiry].copy()
-    try:
-        chain = yf.Ticker(ticker).option_chain(expiry)
-        calls, puts = chain.calls.copy(), chain.puts.copy()
-        calls["type"], puts["type"] = "call", "put"
-        return pd.concat([calls, puts], ignore_index=True)
-    except Exception:
-        return pd.DataFrame()
-
-
-# =============================================================================
-# 2. PRICING LAYER — BSM, binomial, Monte Carlo, Heston, Merton jump-diffusion
-# =============================================================================
-
-def bsm_price(spot, strike, rate, div_yield, vol, tau, option_type="call") -> float:
-    if tau <= 0 or vol <= 0:
-        return max(0.0, spot - strike) if option_type == "call" else max(0.0, strike - spot)
-    d1 = (np.log(spot / strike) + (rate - div_yield + 0.5 * vol ** 2) * tau) / (vol * np.sqrt(tau))
-    d2 = d1 - vol * np.sqrt(tau)
-    if option_type == "call":
-        return spot * np.exp(-div_yield * tau) * norm.cdf(d1) - strike * np.exp(-rate * tau) * norm.cdf(d2)
-    return strike * np.exp(-rate * tau) * norm.cdf(-d2) - spot * np.exp(-div_yield * tau) * norm.cdf(-d1)
-
-
-def bsm_greeks(spot, strike, rate, div_yield, vol, tau, option_type="call") -> dict:
-    """First-order Greeks: delta, gamma, vega, theta, rho."""
-    if tau <= 0 or vol <= 0:
-        return {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
-    d1 = (np.log(spot / strike) + (rate - div_yield + 0.5 * vol ** 2) * tau) / (vol * np.sqrt(tau))
-    d2 = d1 - vol * np.sqrt(tau)
-    pdf_d1 = norm.pdf(d1)
-    disc_q = np.exp(-div_yield * tau)
-    disc_r = np.exp(-rate * tau)
-
-    gamma = disc_q * pdf_d1 / (spot * vol * np.sqrt(tau))
-    vega = spot * disc_q * pdf_d1 * np.sqrt(tau) / 100
-
-    if option_type == "call":
-        delta = disc_q * norm.cdf(d1)
-        theta = (-spot * disc_q * pdf_d1 * vol / (2 * np.sqrt(tau))
-                 - rate * strike * disc_r * norm.cdf(d2)
-                 + div_yield * spot * disc_q * norm.cdf(d1)) / 365
-        rho = strike * tau * disc_r * norm.cdf(d2) / 100
-    else:
-        delta = disc_q * (norm.cdf(d1) - 1)
-        theta = (-spot * disc_q * pdf_d1 * vol / (2 * np.sqrt(tau))
-                 + rate * strike * disc_r * norm.cdf(-d2)
-                 - div_yield * spot * disc_q * norm.cdf(-d1)) / 365
-        rho = -strike * tau * disc_r * norm.cdf(-d2) / 100
-
-    return {"delta": delta, "gamma": gamma, "vega": vega, "theta": theta, "rho": rho}
-
-
-def bsm_greeks_second_order(spot, strike, rate, div_yield, vol, tau, option_type="call") -> dict:
-    """
-    Second-order Greeks:
-      vanna = d(delta)/d(vol)  -- how delta shifts as vol moves
-      volga (vomma) = d(vega)/d(vol) -- how vega shifts as vol moves
-      charm = d(delta)/d(time) -- how delta decays as time passes
-    """
-    if tau <= 0 or vol <= 0:
-        return {"vanna": 0.0, "volga": 0.0, "charm": 0.0}
-    d1 = (np.log(spot / strike) + (rate - div_yield + 0.5 * vol ** 2) * tau) / (vol * np.sqrt(tau))
-    d2 = d1 - vol * np.sqrt(tau)
-    pdf_d1 = norm.pdf(d1)
-    disc_q = np.exp(-div_yield * tau)
-
-    vanna = -disc_q * pdf_d1 * d2 / vol
-    volga = spot * disc_q * pdf_d1 * np.sqrt(tau) * d1 * d2 / vol
-
-    if option_type == "call":
-        charm = (div_yield * disc_q * norm.cdf(d1)
-                 - disc_q * pdf_d1 * (2 * (rate - div_yield) * tau - d2 * vol * np.sqrt(tau))
-                 / (2 * tau * vol * np.sqrt(tau))) / 365
-    else:
-        charm = (-div_yield * disc_q * norm.cdf(-d1)
-                 - disc_q * pdf_d1 * (2 * (rate - div_yield) * tau - d2 * vol * np.sqrt(tau))
-                 / (2 * tau * vol * np.sqrt(tau))) / 365
-
-    return {"vanna": vanna, "volga": volga / 100, "charm": charm}
-
-
-def binomial_price(spot, strike, rate, div_yield, vol, tau, option_type="call",
-                    style="european", steps=200) -> float:
-    if tau <= 0 or vol <= 0:
-        return max(0.0, spot - strike) if option_type == "call" else max(0.0, strike - spot)
-
-    dt = tau / steps
-    u = np.exp(vol * np.sqrt(dt))
-    d = 1 / u
-    p = (np.exp((rate - div_yield) * dt) - d) / (u - d)
-    disc = np.exp(-rate * dt)
-
-    j = np.arange(steps + 1)
-    prices = spot * (u ** (steps - j)) * (d ** j)
-    values = np.maximum(prices - strike, 0.0) if option_type == "call" else np.maximum(strike - prices, 0.0)
-
-    for i in range(steps - 1, -1, -1):
-        values = disc * (p * values[:-1] + (1 - p) * values[1:])
-        if style == "american":
-            j = np.arange(i + 1)
-            prices_i = spot * (u ** (i - j)) * (d ** j)
-            intrinsic = (np.maximum(prices_i - strike, 0.0) if option_type == "call"
-                         else np.maximum(strike - prices_i, 0.0))
-            values = np.maximum(values, intrinsic)
-
-    return float(values[0])
-
-
-def monte_carlo_price(spot, strike, rate, div_yield, vol, tau, option_type="call",
-                       n_paths=50_000, seed=42):
-    if tau <= 0 or vol <= 0:
-        payoff = max(0.0, spot - strike) if option_type == "call" else max(0.0, strike - spot)
-        return payoff, 0.0
-    rng = np.random.default_rng(seed)
-    z = rng.standard_normal(n_paths)
-    terminal = spot * np.exp((rate - div_yield - 0.5 * vol ** 2) * tau + vol * np.sqrt(tau) * z)
-    payoff = np.maximum(terminal - strike, 0.0) if option_type == "call" else np.maximum(strike - terminal, 0.0)
-    disc_payoff = np.exp(-rate * tau) * payoff
-    return float(disc_payoff.mean()), float(disc_payoff.std(ddof=1) / np.sqrt(n_paths))
-
-
-def heston_mc_price(spot, strike, rate, div_yield, tau, option_type="call",
-                     v0=0.04, kappa=2.0, theta=0.04, sigma_v=0.3, rho=-0.6,
-                     n_paths=20_000, n_steps=100, seed=42):
-    """
-    Heston stochastic-volatility model, priced via Monte Carlo (Euler
-    discretization with full truncation to keep variance non-negative).
-    rho < 0 (typical for equities) is what generates the volatility skew
-    that flat-vol BSM cannot produce.
-    """
-    rng = np.random.default_rng(seed)
-    dt = tau / n_steps
-    s = np.full(n_paths, spot)
-    v = np.full(n_paths, v0)
-
-    for _ in range(n_steps):
-        z1 = rng.standard_normal(n_paths)
-        z2 = rng.standard_normal(n_paths)
-        zv = z1
-        zs = rho * z1 + np.sqrt(max(1 - rho ** 2, 0)) * z2
-
-        v_pos = np.maximum(v, 0)
-        s = s * np.exp((rate - div_yield - 0.5 * v_pos) * dt + np.sqrt(v_pos * dt) * zs)
-        v = v + kappa * (theta - v_pos) * dt + sigma_v * np.sqrt(v_pos * dt) * zv
-
-    payoff = np.maximum(s - strike, 0.0) if option_type == "call" else np.maximum(strike - s, 0.0)
-    disc_payoff = np.exp(-rate * tau) * payoff
-    return float(disc_payoff.mean()), float(disc_payoff.std(ddof=1) / np.sqrt(n_paths))
-
-
-def merton_jump_price(spot, strike, rate, div_yield, vol, tau, option_type="call",
-                       jump_intensity=0.5, jump_mean=-0.05, jump_std=0.15,
-                       n_paths=20_000, seed=42):
-    """
-    Merton jump-diffusion: GBM plus a compound Poisson jump component.
-    jump_intensity: average jumps/year. jump_mean/std: log-jump size
-    distribution (typically negative mean for equities -- crash risk).
-    """
-    rng = np.random.default_rng(seed)
-    k = np.exp(jump_mean + 0.5 * jump_std ** 2) - 1
-    drift = rate - div_yield - jump_intensity * k - 0.5 * vol ** 2
-
-    n_jumps = rng.poisson(jump_intensity * tau, n_paths)
-    jump_component = np.array([
-        rng.normal(jump_mean, jump_std, nj).sum() if nj > 0 else 0.0
-        for nj in n_jumps
-    ])
-    z = rng.standard_normal(n_paths)
-    terminal = spot * np.exp(drift * tau + vol * np.sqrt(tau) * z + jump_component)
-
-    payoff = np.maximum(terminal - strike, 0.0) if option_type == "call" else np.maximum(strike - terminal, 0.0)
-    disc_payoff = np.exp(-rate * tau) * payoff
-    return float(disc_payoff.mean()), float(disc_payoff.std(ddof=1) / np.sqrt(n_paths))
-
-
-# =============================================================================
-# 3. VOLATILITY LAYER — historical, EWMA, GARCH, ML forecast, implied, surface
-# =============================================================================
-
-def historical_vol(log_returns: pd.Series, window: int = 252) -> float:
-    r = log_returns.dropna().tail(window)
-    return float(r.std() * np.sqrt(252)) if len(r) >= 10 else np.nan
-
-
-def ewma_vol(log_returns: pd.Series, lam: float = 0.94) -> float:
-    r = log_returns.dropna().values
-    if len(r) < 10:
-        return np.nan
-    var = r[0] ** 2
-    for ret in r[1:]:
-        var = lam * var + (1 - lam) * ret ** 2
-    return float(np.sqrt(var * 252))
-
-
-def garch_forecast_vol(log_returns: pd.Series, horizon: int = 5) -> float:
-    r = log_returns.dropna() * 100
-    if len(r) < 100:
-        return np.nan
-    if not HAS_ARCH:
-        return ewma_vol(log_returns)
-    try:
-        model = arch_model(r, vol="Garch", p=1, q=1, dist="normal")
-        fit = model.fit(disp="off")
-        fcast = fit.forecast(horizon=horizon, reindex=False)
-        variance_forecast = fcast.variance.values[-1].mean()
-        daily_vol = np.sqrt(variance_forecast) / 100
-        return float(daily_vol * np.sqrt(252))
-    except Exception:
-        return ewma_vol(log_returns)
-
-
-def ml_vol_forecast(log_returns: pd.Series, window: int = 252):
-    """
-    Random Forest volatility forecaster: trains on lagged realized-vol,
-    squared-return, and rolling-mean features to predict next-period
-    realized volatility, then compares against GARCH out-of-sample.
-    Returns (forecast_vol, in_sample_r2) or (nan, nan) if too little data
-    or scikit-learn isn't installed.
-    """
-    if not HAS_SKLEARN:
-        return np.nan, np.nan
-
-    r = log_returns.dropna()
-    if len(r) < 300:
-        return np.nan, np.nan
-
-    df = pd.DataFrame({"ret": r})
-    df["realized_vol_5d"] = df["ret"].rolling(5).std() * np.sqrt(252)
-    df["realized_vol_20d"] = df["ret"].rolling(20).std() * np.sqrt(252)
-    df["sq_ret"] = df["ret"] ** 2
-    df["target"] = df["ret"].rolling(20).std().shift(-20) * np.sqrt(252)  # forward-looking 20d realized vol
-    df = df.dropna()
-    if len(df) < 100:
-        return np.nan, np.nan
-
-    features = ["realized_vol_5d", "realized_vol_20d", "sq_ret"]
-    X, y = df[features].values, df["target"].values
-    split = int(len(X) * 0.8)
-    X_train, X_test, y_train, y_test = X[:split], X[split:], y[:split], y[split:]
-
-    model = RandomForestRegressor(n_estimators=200, max_depth=5, random_state=42)
-    model.fit(X_train, y_train)
-    r2 = model.score(X_test, y_test) if len(X_test) > 5 else np.nan
-
-    latest_features = df[features].iloc[[-1]].values
-    forecast = float(model.predict(latest_features)[0])
-    return forecast, r2
-
-
-def implied_vol(market_price, spot, strike, rate, div_yield, tau, option_type="call"):
-    if tau <= 0 or market_price <= 0:
-        return np.nan
-    intrinsic = max(0.0, spot - strike) if option_type == "call" else max(0.0, strike - spot)
-    if market_price < intrinsic:
-        return np.nan
-
-    def objective(vol):
-        return bsm_price(spot, strike, rate, div_yield, vol, tau, option_type) - market_price
-
-    try:
-        return brentq(objective, 1e-4, 5.0, maxiter=200)
-    except ValueError:
-        return np.nan
-
-
-def model_free_implied_vol(chain: pd.DataFrame, spot, rate, tau):
-    """
-    Approximates the CBOE VIX-style "model-free" implied volatility: a
-    variance-weighted average across all OTM strikes at one expiry,
-    rather than relying on a single ATM implied vol. More robust because
-    it uses the whole strike range instead of one noisy quote.
-    Formula (simplified CBOE methodology): sigma^2 = (2/tau) * sum[ (dK/K^2) * e^(r*tau) * Q(K) ]
-    """
-    if chain.empty or tau <= 0:
-        return np.nan
-
-    otm = chain[
-        ((chain["type"] == "call") & (chain["strike"] >= spot)) |
-        ((chain["type"] == "put") & (chain["strike"] < spot))
-    ].copy()
-    otm = otm[otm["lastPrice"] > 0].sort_values("strike")
-    if len(otm) < 4:
-        return np.nan
-
-    strikes = otm["strike"].values
-    prices = otm["lastPrice"].values
-    dK = np.gradient(strikes)
-
-    total = np.sum((dK / strikes ** 2) * np.exp(rate * tau) * prices)
-    variance = (2 / tau) * total - (1 / tau) * (spot / strikes[np.argmin(np.abs(strikes - spot))] - 1) ** 2
-    variance = max(variance, 1e-6)
-    return float(np.sqrt(variance))
-
-
-def build_vol_surface(ticker, expiries, spot, rate, div_yield, source, option_type="call", max_expiries=6):
-    """Loops implied_vol() across strikes for several expiries to build a full surface DataFrame."""
-    rows = []
-    for expiry in expiries[:max_expiries]:
-        chain = get_options_chain(ticker, expiry, source)
-        if chain.empty:
-            continue
-        tau = max((parse_expiry_date(expiry) - datetime.now()).days, 1) / 365
-        sub = chain[chain["type"] == option_type]
-        for _, r in sub.iterrows():
-            mp = r.get("lastPrice", np.nan)
-            if pd.isna(mp) or mp <= 0:
-                continue
-            iv = implied_vol(mp, spot, r["strike"], rate, div_yield, tau, option_type)
-            if not np.isnan(iv) and 0.01 < iv < 3:
-                rows.append({"expiry": expiry, "tau": tau, "strike": r["strike"], "iv": iv})
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# 4. STOCHASTIC PATH SIMULATION (for hedging demo)
-# =============================================================================
-
-def simulate_gbm_path(spot, rate, div_yield, vol, tau, n_steps=60, seed=None):
-    rng = np.random.default_rng(seed)
-    dt = tau / n_steps
-    z = rng.standard_normal(n_steps)
-    log_returns = (rate - div_yield - 0.5 * vol ** 2) * dt + vol * np.sqrt(dt) * z
-    return spot * np.exp(np.concatenate([[0], np.cumsum(log_returns)]))
-
-
-# =============================================================================
-# 5. HEDGING LAYER — dynamic delta hedge
-# =============================================================================
-
-def simulate_delta_hedge(price_path, strike, rate, div_yield, vol, tau_total,
-                          option_type="call", rehedge_every=1, cost_bps=5.0):
-    n = len(price_path)
-    dt = tau_total / (n - 1)
-    rows = []
-    cash = bsm_price(price_path[0], strike, rate, div_yield, vol, tau_total, option_type)
-    prev_delta = 0.0
-    shares_held = 0.0
-
-    for i in range(n):
-        t_remaining = max(tau_total - i * dt, 1e-6)
-        s = price_path[i]
-        delta = bsm_greeks(s, strike, rate, div_yield, vol, t_remaining, option_type)["delta"]
-
-        if i % rehedge_every == 0 or i == n - 1:
-            trade = delta - prev_delta
-            trade_cost = abs(trade) * s * (cost_bps / 10_000)
-            cash -= trade * s + trade_cost
-            shares_held += trade
-            prev_delta = delta
-
-        cash *= np.exp(rate * dt)
-        rows.append({"step": i, "spot": s, "delta": delta, "cash": cash, "shares_held": shares_held})
-
-    payoff = max(price_path[-1] - strike, 0.0) if option_type == "call" else max(strike - price_path[-1], 0.0)
-    final_pnl = cash + shares_held * price_path[-1] - payoff
-    return pd.DataFrame(rows), final_pnl
-
-
-# =============================================================================
-# 6. STRATEGY BUILDER — multi-leg payoff diagrams & portfolio Greeks
-# =============================================================================
-
-PRESET_STRATEGIES = {
-    "Long Call": [{"type": "call", "position": 1, "offset": 0.0}],
-    "Long Put": [{"type": "put", "position": 1, "offset": 0.0}],
-    "Covered Call": [{"type": "call", "position": -1, "offset": 0.05}],
-    "Protective Put": [{"type": "put", "position": 1, "offset": -0.05}],
-    "Straddle": [{"type": "call", "position": 1, "offset": 0.0}, {"type": "put", "position": 1, "offset": 0.0}],
-    "Strangle": [{"type": "call", "position": 1, "offset": 0.05}, {"type": "put", "position": 1, "offset": -0.05}],
-    "Bull Call Spread": [{"type": "call", "position": 1, "offset": -0.02}, {"type": "call", "position": -1, "offset": 0.05}],
-    "Bear Put Spread": [{"type": "put", "position": 1, "offset": 0.02}, {"type": "put", "position": -1, "offset": -0.05}],
-    "Iron Condor": [
-        {"type": "put", "position": -1, "offset": -0.05}, {"type": "put", "position": 1, "offset": -0.10},
-        {"type": "call", "position": -1, "offset": 0.05}, {"type": "call", "position": 1, "offset": 0.10},
-    ],
-    "Butterfly (Call)": [
-        {"type": "call", "position": 1, "offset": -0.05}, {"type": "call", "position": -2, "offset": 0.0},
-        {"type": "call", "position": 1, "offset": 0.05},
-    ],
+# Institutional color palette (WCAG-AA compliant on dark bg)
+PALETTE = {
+    "primary":   "#6366f1",   # indigo — brand
+    "secondary": "#22d3ee",   # cyan
+    "success":   "#10b981",   # emerald
+    "warning":   "#f59e0b",   # amber
+    "danger":    "#ef4444",   # red
+    "accent":    "#a78bfa",   # violet
+    "muted":     "#64748b",   # slate
+    "bg":        "#0b0f1a",
+    "surface":   "#151b2b",
+    "border":    "#1f2937",
 }
 
+PLOTLY_TEMPLATE = "plotly_dark"
 
-def build_legs_from_preset(preset_name, spot, rate, div_yield, vol, tau):
-    """Turns a preset's relative strike offsets into concrete legs with priced premiums."""
-    legs = []
-    for leg in PRESET_STRATEGIES[preset_name]:
-        strike = round(spot * (1 + leg["offset"]), 2)
-        premium = bsm_price(spot, strike, rate, div_yield, vol, tau, leg["type"])
-        legs.append({"type": leg["type"], "strike": strike, "position": leg["position"], "premium": premium})
-    return legs
+POPULAR_TICKERS = [
+    ("RELIANCE.NS", "Reliance Industries (RELIANCE.NS) — NSE"),
+    ("INFY.NS",     "Infosys Ltd (INFY.NS) — NSE"),
+    ("TCS.NS",      "Tata Consultancy Services (TCS.NS) — NSE"),
+    ("HDFCBANK.NS", "HDFC Bank (HDFCBANK.NS) — NSE"),
+    ("ICICIBANK.NS","ICICI Bank (ICICIBANK.NS) — NSE"),
+    ("^NSEI",       "Nifty 50 Index (^NSEI) — NSE"),
+    ("^NSEBANK",    "Bank Nifty (^NSEBANK) — NSE"),
+    ("AAPL",        "Apple Inc. (AAPL) — NASDAQ"),
+    ("MSFT",        "Microsoft Corp. (MSFT) — NASDAQ"),
+    ("TSLA",        "Tesla Inc. (TSLA) — NASDAQ"),
+    ("NVDA",        "NVIDIA Corp. (NVDA) — NASDAQ"),
+    ("SPY",         "SPDR S&P 500 ETF (SPY)"),
+    ("QQQ",         "Invesco QQQ (QQQ)"),
+    ("GC=F",        "Gold Futures (GC=F)"),
+    ("BTC-USD",     "Bitcoin USD (BTC-USD)"),
+]
 
+INDIAN_COMPANIES = {
+    "reliance":"RELIANCE.NS","tcs":"TCS.NS","infosys":"INFY.NS",
+    "infy":"INFY.NS","hdfc":"HDFCBANK.NS","hdfc bank":"HDFCBANK.NS",
+    "icici":"ICICIBANK.NS","icici bank":"ICICIBANK.NS",
+    "sbi":"SBIN.NS","sbin":"SBIN.NS","state bank":"SBIN.NS",
+    "wipro":"WIPRO.NS","itc":"ITC.NS","tata motors":"TATAMOTORS.NS",
+    "tata steel":"TATASTEEL.NS","hindustan unilever":"HINDUNILVR.NS",
+    "hul":"HINDUNILVR.NS","bharti airtel":"BHARTIARTL.NS",
+    "airtel":"BHARTIARTL.NS","asian paints":"ASIANPAINT.NS",
+    "maruti":"MARUTI.NS","maruti suzuki":"MARUTI.NS",
+    "bajaj finance":"BAJFINANCE.NS","bajaj auto":"BAJAJ-AUTO.NS",
+    "adani":"ADANIENT.NS","adani enterprises":"ADANIENT.NS",
+    "adani ports":"ADANIPORTS.NS","adani green":"ADANIGREEN.NS",
+    "nifty":"^NSEI","nifty50":"^NSEI","nifty 50":"^NSEI",
+    "bank nifty":"^NSEBANK","banknifty":"^NSEBANK",
+    "sensex":"^BSESN","axis bank":"AXISBANK.NS","axis":"AXISBANK.NS",
+    "kotak":"KOTAKBANK.NS","larsen":"LT.NS","l&t":"LT.NS",
+    "ongc":"ONGC.NS","coal india":"COALINDIA.NS","ntpc":"NTPC.NS",
+    "power grid":"POWERGRID.NS","hcl":"HCLTECH.NS","hcl tech":"HCLTECH.NS",
+    "tech mahindra":"TECHM.NS","sun pharma":"SUNPHARMA.NS",
+    "dr reddy":"DRREDDY.NS","cipla":"CIPLA.NS","divis":"DIVISLAB.NS",
+    "titan":"TITAN.NS","nestle":"NESTLEIND.NS","britannia":"BRITANNIA.NS",
+    "zomato":"ZOMATO.NS","paytm":"PAYTM.NS","nykaa":"NYKAA.NS",
+    "ioc":"IOC.NS","indian oil":"IOC.NS","bpcl":"BPCL.NS",
+}
 
-def payoff_at_expiry(legs, spot_range):
-    """Computes total P&L at expiry across a range of terminal spot prices."""
-    total = np.zeros_like(spot_range)
-    for leg in legs:
-        intrinsic = (np.maximum(spot_range - leg["strike"], 0.0) if leg["type"] == "call"
-                     else np.maximum(leg["strike"] - spot_range, 0.0))
-        leg_pnl = leg["position"] * (intrinsic - leg["premium"])
-        total += leg_pnl
-    return total
+US_COMPANIES = {
+    "apple":"AAPL","microsoft":"MSFT","google":"GOOGL","alphabet":"GOOGL",
+    "amazon":"AMZN","tesla":"TSLA","meta":"META","facebook":"META",
+    "netflix":"NFLX","nvidia":"NVDA","amd":"AMD","intel":"INTC",
+    "s&p 500":"^GSPC","sp500":"^GSPC","nasdaq":"^IXIC","dow":"^DJI",
+    "spy":"SPY","qqq":"QQQ","gold":"GC=F","oil":"CL=F",
+    "bitcoin":"BTC-USD","ethereum":"ETH-USD",
+    "berkshire":"BRK-B","jpmorgan":"JPM","visa":"V","walmart":"WMT",
+}
 
-
-def portfolio_greeks(legs, spot, rate, div_yield, vol, tau):
-    """Aggregates first- and second-order Greeks across every leg, weighted by position size."""
-    agg = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0,
-           "vanna": 0.0, "volga": 0.0, "charm": 0.0}
-    for leg in legs:
-        g1 = bsm_greeks(spot, leg["strike"], rate, div_yield, vol, tau, leg["type"])
-        g2 = bsm_greeks_second_order(spot, leg["strike"], rate, div_yield, vol, tau, leg["type"])
-        for k in ["delta", "gamma", "vega", "theta", "rho"]:
-            agg[k] += leg["position"] * g1[k]
-        for k in ["vanna", "volga", "charm"]:
-            agg[k] += leg["position"] * g2[k]
-    return agg
-
-
-# =============================================================================
-# 7. RISK LAYER — VaR / CVaR and scenario stress testing
-# =============================================================================
-
-def var_cvar_parametric(portfolio_delta_dollar, vol, confidence=0.95, horizon_days=1):
-    """Delta-normal parametric VaR/CVaR: approximates the position as a linear (delta) exposure."""
-    daily_vol = vol / np.sqrt(252)
-    z = norm.ppf(1 - confidence)
-    var = -portfolio_delta_dollar * z * daily_vol * np.sqrt(horizon_days)
-    cvar = portfolio_delta_dollar * daily_vol * np.sqrt(horizon_days) * norm.pdf(z) / (1 - confidence)
-    return float(var), float(abs(cvar))
-
-
-def var_cvar_historical(log_returns, portfolio_delta_dollar, confidence=0.95):
-    """Historical-simulation VaR/CVaR: applies real historical daily return shocks to current delta exposure."""
-    r = log_returns.dropna()
-    if len(r) < 30:
-        return np.nan, np.nan
-    pnl_scenarios = portfolio_delta_dollar * r.values
-    var = -np.percentile(pnl_scenarios, (1 - confidence) * 100)
-    tail = pnl_scenarios[pnl_scenarios <= -var]
-    cvar = -tail.mean() if len(tail) > 0 else var
-    return float(var), float(cvar)
-
-
-def stress_test(legs, spot, rate, div_yield, vol, tau):
-    """Full repricing (not just Taylor approximation) of the whole leg book under shock scenarios."""
-    scenarios = [
-        ("Spot -10%", spot * 0.90, vol, rate),
-        ("Spot -5%", spot * 0.95, vol, rate),
-        ("Base case", spot, vol, rate),
-        ("Spot +5%", spot * 1.05, vol, rate),
-        ("Spot +10%", spot * 1.10, vol, rate),
-        ("Vol +50% (spike)", spot, vol * 1.5, rate),
-        ("Vol -30% (crush)", spot, vol * 0.7, rate),
-        ("Rate +100bps", spot, vol, rate + 0.01),
-    ]
-    rows = []
-    base_value = sum(leg["position"] * bsm_price(spot, leg["strike"], rate, div_yield, vol, tau, leg["type"])
-                      for leg in legs)
-    for label, s, v, r in scenarios:
-        value = sum(leg["position"] * bsm_price(s, leg["strike"], r, div_yield, max(v, 1e-4), tau, leg["type"])
-                    for leg in legs)
-        rows.append({"scenario": label, "portfolio_value": value, "pnl_vs_base": value - base_value})
-    return pd.DataFrame(rows)
-
+NSE_FO_TICKERS = {
+    "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","SBIN","AXISBANK",
+    "KOTAKBANK","BHARTIARTL","ITC","HINDUNILVR","LT","BAJFINANCE",
+    "ASIANPAINT","MARUTI","WIPRO","HCLTECH","TECHM","SUNPHARMA",
+    "TATAMOTORS","TATASTEEL","POWERGRID","NTPC","ONGC","COALINDIA",
+    "ADANIENT","ADANIPORTS","BAJAJFINSV","BRITANNIA","CIPLA",
+    "DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HDFCLIFE","HEROMOTOCO",
+    "HINDALCO","INDUSINDBK","JSWSTEEL","M&M","NESTLEIND","SBILIFE",
+    "TATACONSUM","TITAN","ULTRACEMCO","UPL","VEDL","BPCL","IOC",
+}
 
 # =============================================================================
-# 8. BACKTEST LAYER — historical vol-signal backtest + walk-forward validation
+# DATABASE
 # =============================================================================
-
-def historical_vol_signal_backtest(hist: pd.DataFrame, forecast_window=20, realized_window=20,
-                                    z_threshold=0.75, train_frac=0.5):
-    """
-    Since free historical options-chain data isn't available, this backtests
-    a volatility-trading signal directly on price data using a variance-swap
-    -style proxy: at each rebalance date, forecast near-term vol (EWMA), then
-    compare it to the vol that was ACTUALLY realized over the following
-    window. If forecast vol was priced "as if it were implied vol," selling
-    vol when forecast > subsequent realized (and buying when forecast <
-    realized) is profitable -- this proxies a real implied-vs-realized vol
-    trade without needing paid historical options data.
-
-    Walk-forward: the z-score threshold's mean/std are calibrated on the
-    first `train_frac` of the data only, then applied out-of-sample on the
-    remainder, so the signal isn't fit and tested on the same period.
-    """
-    df = hist.copy()
-    df["fcast_vol"] = df["log_return"].rolling(forecast_window).std() * np.sqrt(252)
-    df["realized_fwd_vol"] = df["log_return"].rolling(realized_window).std().shift(-realized_window) * np.sqrt(252)
-    df["vol_gap"] = df["fcast_vol"] - df["realized_fwd_vol"]
-    df = df.dropna(subset=["fcast_vol", "realized_fwd_vol", "vol_gap"])
-    if len(df) < 50:
-        return pd.DataFrame(), {}
-
-    split = int(len(df) * train_frac)
-    train_mean, train_std = df["vol_gap"].iloc[:split].mean(), df["vol_gap"].iloc[:split].std()
-    test = df.iloc[split:].copy()
-    if train_std == 0 or np.isnan(train_std):
-        return pd.DataFrame(), {}
-
-    test["z"] = (test["vol_gap"] - train_mean) / train_std
-    test["signal"] = np.where(test["z"] > z_threshold, "sell_vol",
-                        np.where(test["z"] < -z_threshold, "buy_vol", "flat"))
-
-    # Payoff proxy: a variance-swap-like P&L = notional * (forecast_vol^2 - realized_vol^2)
-    # Selling vol profits when forecast (what you "sold" implied at) > what actually realized.
-    notional = 1.0
-    test["pnl"] = np.where(
-        test["signal"] == "sell_vol", notional * (test["fcast_vol"] ** 2 - test["realized_fwd_vol"] ** 2),
-        np.where(test["signal"] == "buy_vol", notional * (test["realized_fwd_vol"] ** 2 - test["fcast_vol"] ** 2), 0.0)
-    )
-
-    stats = performance_stats(test["pnl"])
-    return test[["fcast_vol", "realized_fwd_vol", "z", "signal", "pnl"]], stats
-
-
-def performance_stats(pnl_series: pd.Series) -> dict:
-    pnl = pnl_series.dropna()
-    if len(pnl) < 5:
-        return {}
-    active = pnl[pnl != 0]
-    mean, std = pnl.mean(), pnl.std()
-    sharpe = (mean / std) * np.sqrt(252) if std > 0 else np.nan
-    downside = pnl[pnl < 0].std()
-    sortino = (mean / downside) * np.sqrt(252) if downside and downside > 0 else np.nan
-    cum = pnl.cumsum()
-    running_max = cum.cummax()
-    drawdown = cum - running_max
-    max_dd = drawdown.min()
-    calmar = (mean * 252) / abs(max_dd) if max_dd != 0 else np.nan
-    win_rate = (active > 0).mean() if len(active) > 0 else np.nan
-    return {
-        "Sharpe": sharpe, "Sortino": sortino, "Calmar": calmar,
-        "Max Drawdown": max_dd, "Win Rate": win_rate,
-        "Total P&L (proxy units)": pnl.sum(), "Num Active Signals": len(active),
-    }
-
-
-# =============================================================================
-# 9. TRACK RECORD DATABASE — logs every recommendation for later evaluation
-# =============================================================================
-
-DB_PATH = "optika_track_record.db"
-
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS recommendations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT, ticker TEXT, asset_class TEXT,
-            verdict TEXT, score REAL, spot_at_call REAL
-        )
-    """)
+    conn.execute("""CREATE TABLE IF NOT EXISTS snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, ticker TEXT, spot REAL, iv REAL,
+        hist_vol REAL, ewma_vol REAL, garch_vol REAL,
+        rate REAL, div_yield REAL,
+        options_verdict TEXT, futures_verdict TEXT,
+        data_source TEXT
+    )""")
     conn.commit()
     conn.close()
 
-
-def log_recommendation(ticker, asset_class, verdict, score, spot):
+def save_snapshot(ticker, spot, iv, h_vol, e_vol, g_vol,
+                   rate, div_yield, opt_v, fut_v, source):
     try:
         conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "INSERT INTO recommendations (timestamp, ticker, asset_class, verdict, score, spot_at_call) VALUES (?, ?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(), ticker, asset_class, verdict, score, spot),
-        )
+        conn.execute("""INSERT INTO snapshots
+            (ts,ticker,spot,iv,hist_vol,ewma_vol,garch_vol,
+             rate,div_yield,options_verdict,futures_verdict,data_source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (datetime.now().isoformat(), ticker, spot, iv,
+             h_vol, e_vol, g_vol, rate, div_yield, opt_v, fut_v, source))
         conn.commit()
         conn.close()
     except Exception:
         pass
 
+init_db()
 
-def get_recommendation_history(ticker=None):
+# =============================================================================
+# SEARCH
+# =============================================================================
+
+def search_ticker_live(query, max_results=12):
+    query = query.strip()
+    if not query:
+        return POPULAR_TICKERS
+
+    results, seen = [], set()
+    key, key_upper = query.lower(), query.upper()
+
+    def add(sym, label, score):
+        if sym not in seen:
+            results.append((sym, label, score))
+            seen.add(sym)
+
+    # Exact Indian match — highest priority
+    for name, sym in INDIAN_COMPANIES.items():
+        if key == name:
+            add(sym, f"⭐ {name.title()} ({sym}) — NSE India", 100)
+
+    # Exact US match
+    for name, sym in US_COMPANIES.items():
+        if key == name:
+            add(sym, f"⭐ {name.title()} ({sym})", 95)
+
+    # NSE F&O exact ticker
+    if key_upper in NSE_FO_TICKERS:
+        add(f"{key_upper}.NS", f"⭐ {key_upper} ({key_upper}.NS) — NSE F&O", 90)
+
+    # Indian substring
+    for name, sym in INDIAN_COMPANIES.items():
+        if key in name and key != name:
+            add(sym, f"🇮🇳 {name.title()} ({sym}) — NSE", 80)
+
+    # NSE F&O prefix
+    for fo_sym in NSE_FO_TICKERS:
+        if fo_sym.startswith(key_upper) and fo_sym != key_upper:
+            add(f"{fo_sym}.NS", f"🇮🇳 {fo_sym} ({fo_sym}.NS) — NSE F&O", 70)
+
+    # US substring
+    for name, sym in US_COMPANIES.items():
+        if key in name and key != name:
+            add(sym, f"🇺🇸 {name.title()} ({sym})", 60)
+
+    has_strong_indian = any(s >= 80 for _, _, s in results)
+
+    # Yahoo search — filtered when strong local match exists
     try:
-        conn = sqlite3.connect(DB_PATH)
-        query = "SELECT * FROM recommendations"
-        params = ()
-        if ticker:
-            query += " WHERE ticker = ?"
-            params = (ticker,)
-        query += " ORDER BY timestamp DESC LIMIT 50"
-        df = pd.read_sql_query(query, conn, params=params)
-        conn.close()
-        return df
+        resp = requests.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": query, "quotesCount": max_results,
+                    "newsCount": 0, "enableFuzzyQuery": True},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
+        if resp.status_code == 200:
+            for q in resp.json().get("quotes", []):
+                sym = q.get("symbol", "")
+                name = q.get("shortname") or q.get("longname") or sym
+                exch = q.get("exchDisp", "")
+                if not sym or sym in seen:
+                    continue
+                is_indian = sym.endswith(".NS") or sym.endswith(".BO")
+                if has_strong_indian and not is_indian:
+                    continue
+                flag = ("🇮🇳" if is_indian
+                         else "🇺🇸" if exch in ["NASDAQ","NYSE","NYSEArca"]
+                         else "🌐")
+                score = 65 if is_indian else 40
+                add(sym, f"{flag} {name} ({sym}) — {exch}", score)
     except Exception:
-        return pd.DataFrame()
+        pass
 
+    for sym, label in POPULAR_TICKERS:
+        if sym.upper().startswith(key_upper) and sym not in seen:
+            add(sym, label, 30)
+
+    if not results:
+        add(query.upper().replace(" ", ""),
+             f"{query.upper()} (as-is)", 10)
+
+    results.sort(key=lambda x: -x[2])
+    return [(s, l) for s, l, _ in results[:max_results]]
 
 # =============================================================================
-# 10. FUTURES / FORWARD FAIR VALUE (cost of carry)
+# DATA — SPOT & HISTORY
 # =============================================================================
 
-def theoretical_forward_price(spot, rate, div_yield, tau) -> float:
-    return spot * np.exp((rate - div_yield) * tau)
+def _rt_spot_yfinance(ticker):
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        p = getattr(fi, "last_price", None) or getattr(fi, "regular_market_price", None)
+        if p and p > 0:
+            return float(p), "Yahoo Finance (live)"
+    except Exception:
+        pass
+    return None, None
 
+def _rt_spot_nse(ticker):
+    if not ticker.endswith(".NS"):
+        return None, None
+    try:
+        symbol = ticker.replace(".NS", "")
+        s = requests.Session()
+        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+             "Accept": "application/json",
+             "Referer": "https://www.nseindia.com/"}
+        s.get("https://www.nseindia.com/", headers=h, timeout=5)
+        r = s.get(f"https://www.nseindia.com/api/quote-equity?symbol={symbol}",
+                    headers=h, timeout=5)
+        if r.status_code == 200:
+            p = r.json().get("priceInfo", {}).get("lastPrice")
+            if p:
+                return float(p), "NSE India (live)"
+    except Exception:
+        pass
+    return None, None
 
-def generate_summary_report(ticker, ccy, spot, rate, div_yield, source,
-                             h_vol, e_vol, g_vol, iv, ml_vol, mf_iv,
-                             have_options, expiry, strike, option_type, tau,
-                             bsm_p, binom_p, mc_p, greeks1, greeks2,
-                             heston_p, jump_p, hedge_pnl,
-                             fwd, market_futures,
-                             opt_verdict, opt_notes, fut_verdict, fut_notes,
-                             bt_stats) -> str:
-    """Compiles every computed result across all tabs into one plain-text/markdown report."""
+def _rt_spot_stooq(ticker):
+    """Stooq — free, no key, decent global coverage."""
+    try:
+        clean = ticker.lower().replace("^","").replace("=f",".f")
+        # Convert to Stooq format
+        if clean.endswith(".ns"):
+            clean = clean.replace(".ns", ".in")
+        elif not any(clean.endswith(x) for x in [".in",".uk",".de",".jp",".f"]):
+            clean = clean + ".us"
+        url = f"https://stooq.com/q/l/?s={clean}&f=sd2t2ohlcv&h&e=csv"
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200 and len(r.text) > 20:
+            lines = r.text.strip().split("\n")
+            if len(lines) >= 2:
+                cols = lines[1].split(",")
+                if len(cols) >= 7 and cols[6] not in ("N/D",""):
+                    return float(cols[6]), "Stooq (live)"
+    except Exception:
+        pass
+    return None, None
+
+def get_realtime_spot(ticker, polygon_key="", av_key="", td_key=""):
+    if ticker.endswith(".NS"):
+        p, s = _rt_spot_nse(ticker)
+        if p: return p, s
+    p, s = _rt_spot_yfinance(ticker)
+    if p: return p, s
+    p, s = _rt_spot_stooq(ticker)
+    if p: return p, s
+    return None, None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_yf_history(ticker, period="5y"):
+    try:
+        h = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+        if h.empty:
+            return None, None, None
+        h = h.copy()
+        h["log_return"] = np.log(h["Close"] / h["Close"].shift(1))
+        return float(h["Close"].iloc[-1]), h, "Yahoo Finance"
+    except Exception:
+        return None, None, None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_stooq_history(ticker):
+    """Stooq CSV history — public, no key, up to 10+ years."""
+    try:
+        clean = ticker.lower().replace("^","").replace("=f",".f")
+        if clean.endswith(".ns"):
+            clean = clean.replace(".ns", ".in")
+        elif not any(clean.endswith(x) for x in [".in",".uk",".de",".jp",".f"]):
+            clean = clean + ".us"
+        url = f"https://stooq.com/q/d/l/?s={clean}&i=d"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200 and "Date" in r.text[:20]:
+            df = pd.read_csv(io.StringIO(r.text))
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.set_index("Date").sort_index()
+            df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+            return float(df["Close"].iloc[-1]), df, "Stooq"
+    except Exception:
+        pass
+    return None, None, None
+
+def get_spot_and_history(ticker, av_key="", td_key=""):
+    """Try Yahoo → Stooq → Yahoo max period as fallbacks."""
+    spot, hist, src = _fetch_yf_history(ticker, period="5y")
+    if hist is not None and len(hist) >= 300:
+        return spot, hist, src
+    # Try Stooq
+    spot2, hist2, src2 = _fetch_stooq_history(ticker)
+    if hist2 is not None and (hist is None or len(hist2) > len(hist)):
+        return spot2, hist2, src2
+    # Last resort: Yahoo max
+    if hist is None:
+        spot3, hist3, src3 = _fetch_yf_history(ticker, period="max")
+        if hist3 is not None:
+            return spot3, hist3, src3
+    return spot, hist, src
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_risk_free_rate():
+    try:
+        irx = yf.Ticker("^IRX").history(period="5d")
+        if not irx.empty:
+            r = float(irx["Close"].iloc[-1]) / 100
+            if 0 < r < 0.25:
+                return r
+    except Exception:
+        pass
+    return 0.045
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_dividend_yield(ticker, spot):
+    try:
+        info = yf.Ticker(ticker).info
+        r = info.get("trailingAnnualDividendRate")
+        if r and spot and r > 0:
+            dy = r / spot
+            if 0 <= dy < 0.5:
+                return dy
+        dy = info.get("dividendYield")
+        if dy is None:
+            return 0.0
+        dy = dy if dy < 1 else dy / 100
+        return dy if dy <= 0.5 else 0.0
+    except Exception:
+        return 0.0
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_currency_symbol(ticker):
+    try:
+        code = yf.Ticker(ticker).info.get("currency", "USD")
+        return CURRENCY_SYMBOLS.get(code, code + " ")
+    except Exception:
+        return "$"
+
+# =============================================================================
+# OPTIONS
+# =============================================================================
+
+def _standardise_chain(df):
+    for c in ["bid","ask","lastPrice","openInterest","volume"]:
+        if c not in df.columns:
+            df[c] = 0.0 if c != "openInterest" else 0
+    df["bid"] = pd.to_numeric(df["bid"], errors="coerce").fillna(0)
+    df["ask"] = pd.to_numeric(df["ask"], errors="coerce").fillna(0)
+    df["lastPrice"] = pd.to_numeric(df["lastPrice"], errors="coerce").fillna(0)
+    ba = (df["bid"] > 0) & (df["ask"] > 0)
+    df["mid_price"] = np.where(ba, (df["bid"]+df["ask"])/2, df["lastPrice"])
+    return df
+
+def _get_nse_session():
+    s = requests.Session()
+    h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36",
+         "Accept": "application/json",
+         "Accept-Language": "en-US,en;q=0.9",
+         "Referer": "https://www.nseindia.com/option-chain"}
+    s.headers.update(h)
+    try:
+        s.get("https://www.nseindia.com/", timeout=6)
+        time.sleep(0.3)
+        s.get("https://www.nseindia.com/option-chain", timeout=6)
+    except Exception:
+        pass
+    return s
+
+def _options_nse_live(ticker):
+    if not (ticker.endswith(".NS") or ticker in ["^NSEI","^NSEBANK"]):
+        return [], {}, None, None
+    if ticker == "^NSEI":
+        symbol, is_idx = "NIFTY", True
+    elif ticker == "^NSEBANK":
+        symbol, is_idx = "BANKNIFTY", True
+    else:
+        symbol, is_idx = ticker.replace(".NS", ""), False
+    try:
+        s = _get_nse_session()
+        ep = "indices" if is_idx else "equities"
+        url = f"https://www.nseindia.com/api/option-chain-{ep}?symbol={symbol}"
+        data = None
+        for attempt in range(3):
+            try:
+                r = s.get(url, timeout=8)
+                if r.status_code == 200 and r.text.strip():
+                    try:
+                        data = r.json()
+                        break
+                    except Exception:
+                        pass
+                time.sleep(0.5*(attempt+1))
+            except Exception:
+                time.sleep(0.5)
+        if not data:
+            return [], {}, None, None
+        records = data.get("records", {})
+        underlying = records.get("underlyingValue", 0)
+        raw = records.get("data", [])
+        if not raw:
+            return [], {}, None, None
+        rows = []
+        for item in raw:
+            strike = item.get("strikePrice", 0)
+            exp_str = item.get("expiryDate", "")
+            if not exp_str or not strike:
+                continue
+            try:
+                exp = datetime.strptime(exp_str, "%d-%b-%Y").strftime("%Y-%m-%d")
+            except Exception:
+                continue
+            for side, ot in [(item.get("CE"), "call"), (item.get("PE"), "put")]:
+                if not side:
+                    continue
+                rows.append({
+                    "strike": float(strike), "type": ot, "expiry": exp,
+                    "lastPrice": float(side.get("lastPrice", 0) or 0),
+                    "bid": float(side.get("bidprice", 0) or 0),
+                    "ask": float(side.get("askPrice", 0) or 0),
+                    "openInterest": int(side.get("openInterest", 0) or 0),
+                    "volume": int(side.get("totalTradedVolume", 0) or 0),
+                    "impliedVolatility": float(side.get("impliedVolatility", 0) or 0)/100,
+                })
+        if not rows:
+            return [], {}, None, None
+        df = _standardise_chain(pd.DataFrame(rows))
+        expiries = sorted(df["expiry"].dropna().unique().tolist())
+        chains = {e: df[df["expiry"]==e].copy() for e in expiries}
+        return expiries, chains, "NSE India (live)", underlying
+    except Exception:
+        return [], {}, None, None
+
+def _parse_yahoo_opt(item, opt_type):
+    def gv(x, d=0):
+        if isinstance(x, dict):
+            return x.get("raw", d)
+        return x if x is not None else d
+    try:
+        return {
+            "strike": gv(item.get("strike")),
+            "lastPrice": gv(item.get("lastPrice")),
+            "bid": gv(item.get("bid")),
+            "ask": gv(item.get("ask")),
+            "openInterest": gv(item.get("openInterest")),
+            "volume": gv(item.get("volume")),
+            "impliedVolatility": gv(item.get("impliedVolatility")),
+            "type": opt_type,
+        }
+    except Exception:
+        return None
+
+def _options_yfinance_robust(ticker):
+    chains = {}
+    try:
+        tk = yf.Ticker(ticker)
+        exp_list = list(tk.options)
+        if exp_list:
+            for e in exp_list[:8]:
+                try:
+                    oc = tk.option_chain(e)
+                    calls = oc.calls.copy(); puts = oc.puts.copy()
+                    calls["type"], puts["type"] = "call", "put"
+                    df = pd.concat([calls, puts], ignore_index=True)
+                    df = _standardise_chain(df)
+                    if len(df) > 0:
+                        chains[e] = df
+                except Exception:
+                    continue
+            if chains:
+                return sorted(chains.keys()), chains, "Yahoo Finance"
+    except Exception:
+        pass
+    try:
+        url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}"
+        h = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=h, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            result = data.get("optionChain", {}).get("result", [])
+            if result:
+                item = result[0]
+                for ob in item.get("options", []):
+                    exp_ts = ob.get("expirationDate", 0)
+                    exp = datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%d")
+                    rows = ([_parse_yahoo_opt(c,"call") for c in ob.get("calls",[])] +
+                             [_parse_yahoo_opt(p,"put") for p in ob.get("puts",[])])
+                    rows = [r for r in rows if r]
+                    if rows:
+                        chains[exp] = _standardise_chain(pd.DataFrame(rows))
+                if chains:
+                    return sorted(chains.keys()), chains, "Yahoo v7 API"
+    except Exception:
+        pass
+    return [], {}, None
+
+def _options_cboe_delayed(ticker):
+    try:
+        clean = ticker.upper().split(".")[0]
+        url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{clean}.json"
+        r = requests.get(url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code != 200:
+            return [], {}, None
+        raw = r.json().get("data", [])
+        if not raw:
+            return [], {}, None
+        rows = []
+        for item in raw:
+            opt = item.get("option", "")
+            if not opt:
+                continue
+            try:
+                m = re.search(r"(\d{6})([CP])(\d{8})$", opt.replace(" ",""))
+                if not m:
+                    continue
+                exp_str = m.group(1); pc = m.group(2)
+                strike = int(m.group(3)) / 1000
+                exp = f"20{exp_str[:2]}-{exp_str[2:4]}-{exp_str[4:6]}"
+                ot = "call" if pc == "C" else "put"
+                bid = float(item.get("bid",0) or 0)
+                ask = float(item.get("ask",0) or 0)
+                last = float(item.get("last",0) or 0)
+                rows.append({
+                    "strike": strike, "type": ot, "expiry": exp,
+                    "lastPrice": last, "bid": bid, "ask": ask,
+                    "openInterest": int(item.get("open_interest",0) or 0),
+                    "volume": int(item.get("volume",0) or 0),
+                    "impliedVolatility": float(item.get("iv",0) or 0) / 100,
+                })
+            except Exception:
+                continue
+        if not rows:
+            return [], {}, None
+        df = _standardise_chain(pd.DataFrame(rows))
+        exps = sorted(df["expiry"].dropna().unique().tolist())
+        chains = {e: df[df["expiry"]==e].copy() for e in exps}
+        return exps, chains, "CBOE Delayed"
+    except Exception:
+        return [], {}, None
+
+def _synthetic_chain(spot, rate, div_yield, vol):
+    days_list = [7, 14, 30, 60, 90, 180]
+    pcts = np.array([0.60,0.70,0.80,0.85,0.90,0.925,0.95,0.975,
+                       1.00,1.025,1.05,1.075,1.10,1.15,1.20,1.30,1.40])
+    strikes = np.round(spot * pcts, 2)
+    today = datetime.now()
+    chains, expiries = {}, []
+    for days in days_list:
+        exp = (today + timedelta(days=days)).strftime("%Y-%m-%d")
+        tau = days / 365
+        rows = []
+        for K in strikes:
+            for ot in ["call","put"]:
+                p = bsm_price(spot, float(K), rate, div_yield, vol, tau, ot)
+                sp = max(p*0.02, 0.01)
+                rows.append({
+                    "strike": float(K), "type": ot, "expiry": exp,
+                    "lastPrice": p, "bid": max(0.0, p-sp/2),
+                    "ask": p+sp/2, "mid_price": p,
+                    "openInterest": 0, "volume": 0,
+                    "impliedVolatility": vol, "synthetic": True,
+                })
+        chains[exp] = pd.DataFrame(rows)
+        expiries.append(exp)
+    return expiries, chains
+
+def get_options_data(ticker, polygon_key=""):
+    debug = []
+    is_indian = ticker.endswith(".NS") or ticker in ["^NSEI","^NSEBANK"]
+    is_us = not is_indian and not any(
+        ticker.upper().endswith(s) for s in [".NS",".BO",".L",".TO",".AX",".HK"])
+
+    if is_indian:
+        debug.append("🇮🇳 Trying NSE India...")
+        exp, chains, src, nse_spot = _options_nse_live(ticker)
+        if exp:
+            debug.append(f"   ✅ {src}: {len(exp)} expiries")
+            return exp, chains, src, False, debug, nse_spot
+        debug.append("   ❌ NSE returned no data")
+
+    debug.append("🌐 Trying Yahoo Finance...")
+    exp, chains, src = _options_yfinance_robust(ticker)
+    if exp:
+        debug.append(f"   ✅ {src}: {len(exp)} expiries")
+        return exp, chains, src, False, debug, None
+    debug.append("   ❌ Yahoo returned no data")
+
+    if is_us:
+        debug.append("🇺🇸 Trying CBOE Delayed...")
+        exp, chains, src = _options_cboe_delayed(ticker.upper().split(".")[0])
+        if exp:
+            debug.append(f"   ✅ {src}: {len(exp)} expiries")
+            return exp, chains, src, False, debug, None
+        debug.append("   ❌ CBOE returned no data")
+
+    debug.append("⚠️ Falling back to synthetic BSM chain")
+    return None, None, "Synthetic (BSM)", True, debug, None
+
+# =============================================================================
+# PRICING
+# =============================================================================
+
+def bsm_d1d2(S, K, r, q, v, T):
+    d1 = (np.log(S/K) + (r-q+0.5*v**2)*T) / (v*np.sqrt(T))
+    return d1, d1 - v*np.sqrt(T)
+
+def bsm_price(S, K, r, q, v, T, opt="call"):
+    if T <= 0 or v <= 0:
+        return max(0, S-K) if opt=="call" else max(0, K-S)
+    d1, d2 = bsm_d1d2(S, K, r, q, v, T)
+    if opt == "call":
+        return S*np.exp(-q*T)*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+    return K*np.exp(-r*T)*norm.cdf(-d2) - S*np.exp(-q*T)*norm.cdf(-d1)
+
+def bsm_greeks(S, K, r, q, v, T, opt="call"):
+    z = {k:0.0 for k in ["delta","gamma","vega","theta","rho","vanna","volga","charm"]}
+    if T <= 0 or v <= 0:
+        return z
+    try:
+        d1, d2 = bsm_d1d2(S, K, r, q, v, T)
+        pdf = norm.pdf(d1)
+        dq, dr, st_ = np.exp(-q*T), np.exp(-r*T), np.sqrt(T)
+        gamma = dq*pdf / (S*v*st_)
+        vega = S*dq*pdf*st_ / 100
+        vanna = -dq*pdf*d2 / v
+        volga = vega*d1*d2 / v
+        charm = dq*pdf*(2*(r-q)*T - d2*v*st_) / (2*T*v*st_)
+        if opt == "call":
+            delta = dq*norm.cdf(d1)
+            theta = (-S*dq*pdf*v/(2*st_) - r*K*dr*norm.cdf(d2) + q*S*dq*norm.cdf(d1))/365
+            rho = K*T*dr*norm.cdf(d2) / 100
+        else:
+            delta = dq*(norm.cdf(d1)-1)
+            theta = (-S*dq*pdf*v/(2*st_) + r*K*dr*norm.cdf(-d2) - q*S*dq*norm.cdf(-d1))/365
+            rho = -K*T*dr*norm.cdf(-d2) / 100
+            charm = -charm
+        return {"delta":delta,"gamma":gamma,"vega":vega,"theta":theta,
+                "rho":rho,"vanna":vanna,"volga":volga,"charm":charm}
+    except Exception:
+        return z
+
+def binomial_price(S, K, r, q, v, T, opt="call", style="european", steps=200):
+    if T <= 0 or v <= 0:
+        return max(0, S-K) if opt=="call" else max(0, K-S)
+    dt = T/steps; u = np.exp(v*np.sqrt(dt)); d = 1/u
+    p = (np.exp((r-q)*dt)-d)/(u-d); disc = np.exp(-r*dt)
+    j = np.arange(steps+1)
+    prices = S*(u**(steps-j))*(d**j)
+    vals = np.maximum(prices-K, 0) if opt=="call" else np.maximum(K-prices, 0)
+    for i in range(steps-1, -1, -1):
+        vals = disc*(p*vals[:-1] + (1-p)*vals[1:])
+        if style == "american":
+            ji = np.arange(i+1)
+            pi = S*(u**(i-ji))*(d**ji)
+            intr = np.maximum(pi-K, 0) if opt=="call" else np.maximum(K-pi, 0)
+            vals = np.maximum(vals, intr)
+    return float(vals[0])
+
+def monte_carlo_price(S, K, r, q, v, T, opt="call", n_paths=50_000, seed=42):
+    if T <= 0 or v <= 0:
+        p = max(0, S-K) if opt=="call" else max(0, K-S)
+        return p, 0.0
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal(n_paths)
+    ST = S*np.exp((r-q-0.5*v**2)*T + v*np.sqrt(T)*z)
+    pay = np.maximum(ST-K, 0) if opt=="call" else np.maximum(K-ST, 0)
+    dp = np.exp(-r*T)*pay
+    return float(dp.mean()), float(dp.std(ddof=1)/np.sqrt(n_paths))
+
+def heston_char(phi, S, K, r, q, T, v0, k, th, sv, rh):
+    xi = k - rh*sv*1j*phi
+    d = np.sqrt(xi**2 + sv**2*(phi**2+1j*phi))
+    g = (xi-d)/(xi+d); edt = np.exp(-d*T)
+    C = (r-q)*1j*phi*T + k*th/sv**2 * ((xi-d)*T - 2*np.log((1-g*edt)/(1-g)))
+    D = (xi-d)/sv**2 * (1-edt)/(1-g*edt)
+    return np.exp(C + D*v0 + 1j*phi*np.log(S*np.exp((r-q)*T)))
+
+def heston_price(S, K, r, q, T, v0, k, th, sv, rh, opt="call"):
+    if T <= 0:
+        return max(0, S-K) if opt=="call" else max(0, K-S)
+    Kl = np.log(K)
+    def I1(p):
+        cf = heston_char(p-1j, S, K, r, q, T, v0, k, th, sv, rh)
+        cf0 = heston_char(-1j, S, K, r, q, T, v0, k, th, sv, rh)
+        return np.real(np.exp(-1j*p*Kl)*cf/(1j*p*cf0))
+    def I2(p):
+        cf = heston_char(p, S, K, r, q, T, v0, k, th, sv, rh)
+        return np.real(np.exp(-1j*p*Kl)*cf/(1j*p))
+    try:
+        P1 = 0.5 + (1/math.pi)*quad(I1, 0, 200, limit=100)[0]
+        P2 = 0.5 + (1/math.pi)*quad(I2, 0, 200, limit=100)[0]
+        c = S*np.exp(-q*T)*P1 - K*np.exp(-r*T)*P2
+        return max(0, c) if opt=="call" else max(0, c - S*np.exp(-q*T) + K*np.exp(-r*T))
+    except Exception:
+        return bsm_price(S, K, r, q, max(np.sqrt(v0),0.01), T, opt)
+
+def calibrate_heston(S, r, q, T, ks, ivs, opt="call"):
+    if len(ks) < 3:
+        return {"v0":0.04,"kappa":2.0,"theta":0.04,"sigma_v":0.3,"rho":-0.7}
+    def obj(p):
+        v0,k,th,sv,rh = p
+        if v0<=0 or k<=0 or th<=0 or sv<=0 or abs(rh)>=1:
+            return 1e6
+        errs = []
+        for K, miv in zip(ks, ivs):
+            hp = heston_price(S, K, r, q, T, v0, k, th, sv, rh, opt)
+            biv = implied_vol(hp, S, K, r, q, T, opt)
+            if not np.isnan(biv):
+                errs.append((biv-miv)**2)
+        return np.mean(errs) if errs else 1e6
+    try:
+        res = minimize(obj, [0.04,2.0,0.04,0.3,-0.7],
+                       bounds=[(1e-4,1),(0.1,10),(1e-4,1),(0.01,1),(-0.99,0.99)],
+                       method="L-BFGS-B", options={"maxiter":200})
+        v0,k,th,sv,rh = res.x
+        return {"v0":v0,"kappa":k,"theta":th,"sigma_v":sv,"rho":rh}
+    except Exception:
+        return {"v0":0.04,"kappa":2.0,"theta":0.04,"sigma_v":0.3,"rho":-0.7}
+
+def merton_jump_price(S, K, r, q, v, T, lam=0.75, mu=0, sig=0.15, opt="call", n=40):
+    if T <= 0:
+        return max(0, S-K) if opt=="call" else max(0, K-S)
+    lp = lam*np.exp(mu + 0.5*sig**2)
+    price = 0.0
+    for kk in range(n):
+        w = (np.exp(-lp*T)*(lp*T)**kk) / math.factorial(kk)
+        vk = np.sqrt(v**2 + kk*sig**2/max(T,1e-6))
+        rk = r - lam*(np.exp(mu+0.5*sig**2)-1) + kk*(mu+0.5*sig**2)/max(T,1e-6)
+        price += w*bsm_price(S, K, rk, q, vk, T, opt)
+    return float(price)
+
+def implied_vol(mp, S, K, r, q, T, opt="call"):
+    if T <= 0 or pd.isna(mp) or mp <= 0:
+        return np.nan
+    intr = max(0, S-K) if opt=="call" else max(0, K-S)
+    if mp < intr*0.99:
+        return np.nan
+    def obj(v):
+        return bsm_price(S, K, r, q, v, T, opt) - mp
+    try:
+        return brentq(obj, 1e-4, 5.0, maxiter=200)
+    except ValueError:
+        return np.nan
+
+def model_free_iv(chain, S, r, T):
+    try:
+        if chain.empty:
+            return np.nan
+        pc = "mid_price" if "mid_price" in chain.columns else "lastPrice"
+        calls = chain[(chain["type"]=="call") & (chain["strike"]>S)].sort_values("strike")
+        puts = chain[(chain["type"]=="put") & (chain["strike"]<S)].sort_values("strike")
+        if len(calls) < 2 and len(puts) < 2:
+            return np.nan
+        ss = 0.0; F = S*np.exp(r*T)
+        for df in [calls, puts]:
+            if len(df) < 2:
+                continue
+            ks = df["strike"].values; qs = df[pc].values
+            dks = np.diff(ks)
+            for i in range(len(dks)):
+                ss += 2*dks[i]/(ks[i+1]**2)*np.exp(r*T)*(qs[i]+qs[i+1])/2
+        ss -= (F/S - 1)**2
+        ss = max(0, ss)/T
+        return float(np.sqrt(ss))
+    except Exception:
+        return np.nan
+
+def build_vol_surface(chain_dict, S, r, q, opt="call"):
+    rows = []
+    for exp, chain in chain_dict.items():
+        try:
+            T = max((datetime.strptime(exp,"%Y-%m-%d")-datetime.now()).days, 1)/365
+        except Exception:
+            continue
+        if chain.empty: continue
+        pc = "mid_price" if "mid_price" in chain.columns else "lastPrice"
+        sub = chain[chain["type"]==opt].copy()
+        if sub.empty: continue
+        for _, row in sub.iterrows():
+            K = float(row["strike"]); mp = row.get(pc, np.nan)
+            oi = row.get("openInterest", 0)
+            if pd.isna(mp) or mp <= 0: continue
+            iv = implied_vol(mp, S, K, r, q, T, opt)
+            if np.isnan(iv) or iv<0.01 or iv>3: continue
+            rows.append({"expiry":exp,"strike":K,"moneyness":K/S,
+                          "iv":iv,"tau":T,"oi":float(oi) if oi else 0.0})
+    return pd.DataFrame(rows)
+
+def calculate_pcr(chain):
+    if chain.empty:
+        return None, None
+    ci = chain[chain["type"]=="call"]["openInterest"].sum()
+    pi = chain[chain["type"]=="put"]["openInterest"].sum()
+    cv = chain[chain["type"]=="call"]["volume"].sum()
+    pv = chain[chain["type"]=="put"]["volume"].sum()
+    return (pi/ci if ci>0 else None), (pv/cv if cv>0 else None)
+
+# =============================================================================
+# VOL ESTIMATION
+# =============================================================================
+
+def historical_vol(lr, window=252):
+    r = lr.dropna().tail(window)
+    return float(r.std()*np.sqrt(252)) if len(r) >= 10 else np.nan
+
+def ewma_vol(lr, lam=0.94):
+    r = lr.dropna().values
+    if len(r) < 10:
+        return np.nan
+    var = r[0]**2
+    for ret in r[1:]:
+        var = lam*var + (1-lam)*ret**2
+    return float(np.sqrt(var*252))
+
+def garch_forecast_vol(lr, horizon=5):
+    r = lr.dropna()*100
+    if len(r) < 100 or not HAS_ARCH:
+        return ewma_vol(lr)
+    try:
+        fit = arch_model(r, vol="Garch", p=1, q=1, dist="normal").fit(disp="off")
+        fc = fit.forecast(horizon=horizon, reindex=False)
+        vf = fc.variance.values[-1].mean()
+        return float(np.sqrt(vf)/100*np.sqrt(252))
+    except Exception:
+        return ewma_vol(lr)
+
+def xgboost_vol_forecast(lr, fd=5):
+    if not HAS_XGB or len(lr.dropna()) < 120:
+        return np.nan
+    try:
+        r = lr.dropna().copy()
+        df = pd.DataFrame({"r": r})
+        for lag in [1,2,3,5]:
+            df[f"abs{lag}"] = df["r"].abs().shift(lag)
+        for w in [5,10,21]:
+            df[f"rv{w}"] = df["r"].rolling(w).std()*np.sqrt(252)
+        df["target"] = df["r"].rolling(fd).std().shift(-fd)*np.sqrt(252)
+        df = df.dropna()
+        if len(df) < 60:
+            return np.nan
+        s = int(len(df)*0.8)
+        X_tr, y_tr = df.iloc[:s,:-1].values, df.iloc[:s,-1].values
+        X_te = df.iloc[-1:,:-1].values
+        m = xgb.XGBRegressor(n_estimators=100, max_depth=3,
+                              learning_rate=0.05, verbosity=0)
+        m.fit(X_tr, y_tr)
+        return max(float(m.predict(X_te)[0]), 0.01)
+    except Exception:
+        return np.nan
+
+def realized_vol_series(lr, window=21):
+    return lr.rolling(window).std()*np.sqrt(252)
+
+# =============================================================================
+# STRATEGIES
+# =============================================================================
+
+STRATEGIES = {
+    "Long Call":       [("call",+1,1.00)],
+    "Long Put":        [("put",+1,1.00)],
+    "Short Call":      [("call",-1,1.00)],
+    "Short Put":       [("put",-1,1.00)],
+    "Long Straddle":   [("call",+1,1.00),("put",+1,1.00)],
+    "Short Straddle":  [("call",-1,1.00),("put",-1,1.00)],
+    "Long Strangle":   [("call",+1,1.05),("put",+1,0.95)],
+    "Bull Call Spread":[("call",+1,1.00),("call",-1,1.05)],
+    "Bear Put Spread": [("put",+1,1.00),("put",-1,0.95)],
+    "Iron Condor":     [("put",-1,0.90),("put",+1,0.95),
+                        ("call",+1,1.05),("call",-1,1.10)],
+    "Butterfly":       [("call",+1,0.95),("call",-2,1.00),("call",+1,1.05)],
+}
+
+def strategy_payoff(strat, S, r, q, v, T):
+    legs = STRATEGIES.get(strat, [])
+    sr = np.linspace(S*0.5, S*1.5, 300)
+    net_pay = np.zeros(300); net_prem = 0.0; info = []
+    for (ot, qty, mm) in legs:
+        K = S*mm
+        pr = bsm_price(S, K, r, q, v, T, ot)
+        net_prem += qty*pr
+        pay = np.maximum(sr-K, 0) if ot=="call" else np.maximum(K-sr, 0)
+        net_pay += qty*pay
+        info.append({"type":ot,"qty":qty,"strike":round(K,2),"premium":round(pr,4)})
+    pnl = net_pay + net_prem
+    bes = []
+    for i in range(len(pnl)-1):
+        if pnl[i]*pnl[i+1] < 0:
+            be = sr[i] + (0-pnl[i])/(pnl[i+1]-pnl[i])*(sr[i+1]-sr[i])
+            bes.append(round(float(be), 2))
+    return sr, pnl, net_prem, info, bes, float(pnl.max()), float(pnl.min())
+
+# =============================================================================
+# RISK
+# =============================================================================
+
+def calculate_var_cvar(lr, conf=0.95, days=1, pv=100_000):
+    r = lr.dropna()
+    if len(r) < 30:
+        return {}
+    sr = r*np.sqrt(days)
+    mu, sig = sr.mean(), sr.std()
+    z = norm.ppf(1-conf)
+    pvar = -(mu+z*sig)*pv
+    pcvar = -(mu-sig*norm.pdf(z)/(1-conf))*pv
+    hvar = -np.percentile(sr, (1-conf)*100)*pv
+    mask = sr <= (-hvar/pv)
+    hcvar = -sr[mask].mean()*pv if mask.any() else hvar
+    return {"param_var":pvar,"param_cvar":pcvar,"hist_var":hvar,"hist_cvar":hcvar}
+
+def stress_test(S, K, r, q, v, T, gr, opt, qty=1):
+    base = bsm_price(S, K, r, q, v, T, opt)
+    sh = {
+        "Spot −20%":{"dS":-0.20*S,"dV":0,"dR":0},
+        "Spot −10%":{"dS":-0.10*S,"dV":0,"dR":0},
+        "Spot −5%": {"dS":-0.05*S,"dV":0,"dR":0},
+        "Spot +5%": {"dS":+0.05*S,"dV":0,"dR":0},
+        "Spot +10%":{"dS":+0.10*S,"dV":0,"dR":0},
+        "Spot +20%":{"dS":+0.20*S,"dV":0,"dR":0},
+        "Vol +25%": {"dS":0,"dV":+0.25*v,"dR":0},
+        "Vol +50%": {"dS":0,"dV":+0.50*v,"dR":0},
+        "Vol −25%": {"dS":0,"dV":-0.25*v,"dR":0},
+        "Rate +100bp":{"dS":0,"dV":0,"dR":+0.01},
+        "Rate −100bp":{"dS":0,"dV":0,"dR":-0.01},
+        "Crash":    {"dS":-0.20*S,"dV":+0.50*v,"dR":-0.005},
+    }
+    out = {}
+    for n, s in sh.items():
+        exact = (bsm_price(S+s["dS"], K, r+s["dR"], q, v+s["dV"], T, opt) - base)*qty
+        approx = (gr["delta"]*s["dS"] + 0.5*gr["gamma"]*s["dS"]**2
+                   + gr["vega"]*100*(s["dV"]/0.01)*0.01
+                   + gr["rho"]*100*(s["dR"]/0.01)*0.01)*qty
+        out[n] = {"approx_pnl":approx, "exact_pnl":exact}
+    return out
+
+# =============================================================================
+# HEDGING & FUTURES
+# =============================================================================
+
+def simulate_gbm_path(S, r, q, v, T, n=60, seed=None):
+    rng = np.random.default_rng(seed)
+    dt = T/n; z = rng.standard_normal(n)
+    lr = (r-q-0.5*v**2)*dt + v*np.sqrt(dt)*z
+    return S*np.exp(np.concatenate([[0], np.cumsum(lr)]))
+
+def simulate_delta_hedge(path, K, r, q, v, T, opt="call", rehedge=1, cost_bps=5):
+    n = len(path); dt = T/(n-1)
+    cash = bsm_price(path[0], K, r, q, v, T, opt)
+    prev_d, shares, rows = 0.0, 0.0, []
+    for i in range(n):
+        trem = max(T-i*dt, 1e-6); s = path[i]
+        delta = bsm_greeks(s, K, r, q, v, trem, opt)["delta"]
+        if i % rehedge == 0 or i == n-1:
+            trade = delta - prev_d
+            cash -= trade*s + abs(trade)*s*(cost_bps/10_000)
+            shares += trade; prev_d = delta
+        cash *= np.exp(r*dt)
+        rows.append({"step":i,"spot":s,"delta":delta,"cash":cash})
+    payoff = max(path[-1]-K, 0) if opt=="call" else max(K-path[-1], 0)
+    return pd.DataFrame(rows), cash + shares*path[-1] - payoff
+
+def theoretical_forward_price(S, r, q, T):
+    return S*np.exp((r-q)*T)
+
+# =============================================================================
+# BACKTEST
+# =============================================================================
+
+def walk_forward_backtest(hist, vol_threshold=0.15, n_windows=5, min_days=100):
+    r = hist["log_return"].dropna()
+    total = len(r)
+    if total < min_days:
+        return pd.DataFrame(), f"Need ≥{min_days} days, got {total}"
+    if total >= 504: lw, nw = 252, min(n_windows, 5)
+    elif total >= 252: lw, nw = 126, min(n_windows, 4)
+    elif total >= 150: lw, nw = 63, min(n_windows, 3)
+    else: lw, nw = 42, min(n_windows, 3)
+    step = max((total - lw)//(nw+1), 20)
+    results = []
+    for w in range(nw):
+        te = lw + w*step; ts = te; tend = min(ts+step, total)
+        if tend - ts < 5: continue
+        tr = r.iloc[:te]; testr = r.iloc[ts:tend]
+        ev = ewma_vol(tr); hv = historical_vol(tr, window=min(252, len(tr)))
+        sig = ("sell" if not np.isnan(ev) and not np.isnan(hv)
+                and ev > hv*(1+vol_threshold) else "hold")
+        rv = float(testr.std()*np.sqrt(252)) if len(testr) > 5 else np.nan
+        pnl = (ev-rv) if sig == "sell" and not np.isnan(rv) else 0.0
+        results.append({"window":w+1,"train_days":te,"ewma_vol":ev,
+                          "hist_vol":hv,"signal":sig,"realized_vol":rv,
+                          "approx_pnl":pnl})
+    df = pd.DataFrame(results)
+    return df, f"Adaptive: {total} days → {lw}d train × {nw} windows"
+
+def performance_stats(pnl):
+    r = pnl.dropna()
+    if len(r) < 2:
+        return {}
+    mu = r.mean(); sd = r.std(ddof=1) if len(r) > 1 else 0
+    sharpe = mu/sd*np.sqrt(252) if sd > 0 else np.nan
+    down = r[r<0].std(ddof=1) if len(r[r<0]) > 1 else 0
+    sortino = mu/down*np.sqrt(252) if down > 0 else np.nan
+    cr = (1+r).cumprod(); peak = cr.cummax()
+    max_dd = float(((cr-peak)/peak).min())
+    calmar = mu*252/abs(max_dd) if max_dd < 0 else np.nan
+    if len(r) >= 3:
+        rng = np.random.default_rng(42)
+        boots = [rng.choice(r.values, size=len(r), replace=True).mean() for _ in range(2000)]
+        pv = float(np.mean(np.array(boots) <= 0))
+    else:
+        pv = np.nan
+    return {"sharpe":sharpe,"sortino":sortino,"calmar":calmar,
+            "max_dd":max_dd,"p_value":pv}
+
+# =============================================================================
+# RECOMMENDATIONS
+# =============================================================================
+
+def rec_options(iv, fv, hv, trend, mn, days, pcr=None):
+    notes, score = [], 0
+    if not np.isnan(iv) and not np.isnan(fv) and fv > 0:
+        gap = (iv-fv)/fv
+        if gap > 0.15:
+            score -= 2; notes.append(f"IV ({iv:.1%}) is {gap:.0%} above forecast ({fv:.1%}) — options **rich**.")
+        elif gap < -0.15:
+            score += 2; notes.append(f"IV ({iv:.1%}) is {abs(gap):.0%} below forecast ({fv:.1%}) — options **cheap**.")
+        else:
+            notes.append(f"IV ({iv:.1%}) in line with forecast ({fv:.1%}).")
+    if trend == "up":
+        score += 1; notes.append("Uptrend (50d > 200d MA) — bullish bias.")
+    elif trend == "down":
+        score -= 1; notes.append("Downtrend (50d < 200d MA) — bearish bias.")
+    if days < 14:
+        score -= 1; notes.append(f"Only {days}d to expiry — theta risk.")
+    if pcr is not None:
+        if pcr > 1.3:
+            score += 1; notes.append(f"PCR={pcr:.2f} — contrarian bullish.")
+        elif pcr < 0.7:
+            score -= 1; notes.append(f"PCR={pcr:.2f} — contrarian bearish.")
+        else:
+            notes.append(f"PCR={pcr:.2f} — neutral.")
+    if score >= 2: v = "🟢 LEAN: BUY OPTIONS"
+    elif score <= -2: v = "🔴 LEAN: SELL PREMIUM"
+    else: v = "⚖️ NEUTRAL"
+    return v, notes, score
+
+def rec_futures(S, fwd, mkt, r, q, trend, T, ccy):
+    notes, score = [], 0
+    carry = r - q
+    lbl = "contango" if carry > 0 else "backwardation"
+    notes.append(f"Net carry {carry:+.2%} → **{lbl}**. Fair fwd {ccy}{fwd:.2f}.")
+    arb = False
+    if mkt and mkt > 0:
+        mis = (mkt-fwd)/fwd
+        if abs(mis) > 0.005:
+            arb = True
+            if mis > 0:
+                score += 2; notes.append(f"Market fut {mis:+.2%} above fair → cash-and-carry arb.")
+            else:
+                score -= 2; notes.append(f"Market fut {mis:+.2%} below fair → reverse arb.")
+    if trend == "up":
+        score += 1; notes.append("Uptrend → LONG futures.")
+    elif trend == "down":
+        score -= 1; notes.append("Downtrend → SHORT futures.")
+    if arb:
+        v = "🔄 ARB: BUY futures" if score > 0 else "🔄 ARB: SELL futures"
+    elif score >= 2: v = "🟢 LEAN: LONG FUTURES"
+    elif score <= -2: v = "🔴 LEAN: SHORT FUTURES"
+    else: v = "⚖️ NEUTRAL"
+    return v, notes, score
+
+# =============================================================================
+# PROFESSIONAL REPORT
+# =============================================================================
+
+def build_professional_report(rd):
+    ccy = rd.get("ccy","$"); tkr = rd.get("ticker","N/A")
+    S = rd.get("spot",0); r = rd.get("rate",0); q = rd.get("div_yield",0)
+    K = rd.get("strike",0); T = rd.get("tau",0); opt = rd.get("option_type","call")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    v = rd.get("volatility",{}); pr = rd.get("pricing",{})
+    gk = rd.get("greeks",{}); rk = rd.get("risk",{})
+    fd = rd.get("futures",{}); bt = rd.get("backtest",{})
+    ss = rd.get("scenarios",{}); pc = rd.get("pcr")
+
+    def fv(x, fmt="{:.2%}"):
+        return fmt.format(x) if (x is not None and not (isinstance(x,float) and np.isnan(x))) else "N/A"
+    def fp(x):
+        return f"{ccy}{x:.4f}" if x else "N/A"
+
     lines = []
-    lines.append("=" * 70)
-    lines.append("OPTIKA — ANALYSIS REPORT")
-    lines.append("=" * 70)
-    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"Ticker: {ticker}")
-    lines.append(f"Data source: {source}")
+    lines.append("# 📊 QUANT EDGE — INSTITUTIONAL DERIVATIVES ANALYSIS")
     lines.append("")
-    lines.append("-" * 70)
-    lines.append("1. MARKET SNAPSHOT")
-    lines.append("-" * 70)
-    lines.append(f"Spot price:        {ccy}{spot:,.2f}")
-    lines.append(f"Risk-free rate:    {rate:.2%}")
-    lines.append(f"Dividend yield:    {div_yield:.2%}")
+    lines.append(f"**Instrument:** `{tkr}` | **Report ID:** `QE-{datetime.now().strftime('%Y%m%d-%H%M%S')}`")
+    lines.append(f"**Generated:** {now} | **Data Source:** {rd.get('data_source','N/A')}")
     lines.append("")
-    lines.append("-" * 70)
-    lines.append("2. VOLATILITY ESTIMATES")
-    lines.append("-" * 70)
-    lines.append(f"Historical vol (1y):     {h_vol:.2%}" if not np.isnan(h_vol) else "Historical vol: N/A")
-    lines.append(f"EWMA vol:                {e_vol:.2%}" if not np.isnan(e_vol) else "EWMA vol: N/A")
-    lines.append(f"GARCH(1,1) forecast:     {g_vol:.2%}" if not np.isnan(g_vol) else "GARCH forecast: N/A")
-    lines.append(f"ML (Random Forest) fcst: {ml_vol:.2%}" if not np.isnan(ml_vol) else "ML forecast: N/A")
-    lines.append(f"Implied vol (ATM):       {iv:.2%}" if not np.isnan(iv) else "Implied vol: N/A")
-    lines.append(f"Model-free IV (VIX-style): {mf_iv:.2%}" if not np.isnan(mf_iv) else "Model-free IV: N/A")
+    lines.append("---")
     lines.append("")
 
-    if have_options:
-        lines.append("-" * 70)
-        lines.append("3. OPTION CONTRACT & PRICING")
-        lines.append("-" * 70)
-        lines.append(f"Expiry: {expiry}   Strike: {ccy}{strike:.2f}   Type: {option_type}   "
-                      f"Days to expiry: {int(tau * 365)}")
-        lines.append(f"Black-Scholes-Merton:     {ccy}{bsm_p:.2f}")
-        lines.append(f"Binomial (American):      {ccy}{binom_p:.2f}")
-        lines.append(f"Monte Carlo:              {ccy}{mc_p:.2f}")
-        lines.append(f"Heston (stochastic vol):  {ccy}{heston_p:.2f}" if heston_p is not None else "")
-        lines.append(f"Merton (jump-diffusion):  {ccy}{jump_p:.2f}" if jump_p is not None else "")
-        lines.append("")
-        lines.append("Greeks:")
-        lines.append(f"  Delta: {greeks1['delta']:.4f}   Gamma: {greeks1['gamma']:.5f}   "
-                      f"Vega: {greeks1['vega']:.4f}   Theta: {greeks1['theta']:.4f}   Rho: {greeks1['rho']:.4f}")
-        lines.append(f"  Vanna: {greeks2['vanna']:.5f}   Volga: {greeks2['volga']:.5f}   Charm: {greeks2['charm']:.5f}")
-        lines.append("")
-        lines.append(f"Simulated delta-hedge P&L (selling & hedging, illustrative path): {ccy}{hedge_pnl:.2f}")
-        lines.append("")
-
-    lines.append("-" * 70)
-    lines.append("4. FUTURES / FORWARD FAIR VALUE")
-    lines.append("-" * 70)
-    lines.append(f"Theoretical forward price: {ccy}{fwd:.2f}")
-    if market_futures and market_futures > 0:
-        lines.append(f"Market futures quote:      {ccy}{market_futures:.2f}")
+    # Executive Summary
+    lines.append("## 📌 EXECUTIVE SUMMARY")
+    lines.append("")
+    lines.append(f"**Underlying:** {tkr} trading at **{ccy}{S:,.2f}**")
+    lines.append(f"**Contract Analysed:** {opt.upper()} @ Strike {ccy}{K:,.2f}, "
+                  f"{int(T*365)} days to expiry")
+    lines.append("")
+    lines.append(f"### Key Findings")
+    lines.append(f"- **Implied Volatility:** {fv(v.get('iv'))} vs GARCH Forecast: {fv(v.get('garch'))}")
+    lines.append(f"- **Model Price Range:** {fp(pr.get('bsm'))} (BSM) → {fp(pr.get('heston'))} (Heston)")
+    lines.append(f"- **Market Mid:** {fp(pr.get('market'))}")
+    lines.append(f"- **Delta:** {gk.get('delta',0):.4f} | **Gamma:** {gk.get('gamma',0):.6f} | "
+                  f"**Vega:** {gk.get('vega',0):.4f} | **Theta:** {gk.get('theta',0):.4f}/day")
+    if pc is not None:
+        lines.append(f"- **Put-Call Ratio (OI):** {pc:.2f} — "
+                      f"{'Bearish sentiment' if pc>1 else 'Bullish sentiment' if pc<0.7 else 'Neutral'}")
+    lines.append("")
+    lines.append(f"### Trading Signals")
+    lines.append(f"- **Options:** {rd.get('opt_verdict','N/A')}")
+    lines.append(f"- **Futures:** {rd.get('fut_verdict','N/A')}")
+    lines.append("")
+    lines.append("---")
     lines.append("")
 
-    if bt_stats:
-        lines.append("-" * 70)
-        lines.append("5. VOLATILITY-SIGNAL BACKTEST (walk-forward, proxy P&L)")
-        lines.append("-" * 70)
-        for k, v in bt_stats.items():
-            lines.append(f"  {k}: {v:.3f}" if isinstance(v, float) else f"  {k}: {v}")
+    # Section 1: Market Environment
+    lines.append("## 1️⃣ MARKET ENVIRONMENT")
+    lines.append("")
+    lines.append("| Parameter | Value | Notes |")
+    lines.append("|-----------|-------|-------|")
+    lines.append(f"| Spot Price | {ccy}{S:,.2f} | Live/last available |")
+    lines.append(f"| Risk-Free Rate | {r:.2%} | 13W T-Bill (^IRX) |")
+    lines.append(f"| Dividend Yield | {q:.2%} | Trailing 12M |")
+    lines.append(f"| Net Carry (r-q) | {r-q:+.2%} | {'Contango' if r>q else 'Backwardation'} |")
+    lines.append(f"| Time to Expiry | {T*365:.0f} days ({T:.4f} yrs) | |")
+    lines.append(f"| Moneyness (K/S) | {K/S:.4f} | "
+                  f"{'ITM' if (opt=='call' and K<S) or (opt=='put' and K>S) else 'OTM' if abs(K/S-1)>0.02 else 'ATM'} |")
+    lines.append("")
+
+    # Section 2: Volatility Analysis
+    lines.append("## 2️⃣ VOLATILITY ANALYSIS")
+    lines.append("")
+    lines.append("### 2.1 Multi-Model Volatility Estimates")
+    lines.append("")
+    lines.append("| Model | Estimate | Description |")
+    lines.append("|-------|----------|-------------|")
+    lines.append(f"| Historical (1Y) | {fv(v.get('hist'))} | Realized annualised std dev |")
+    lines.append(f"| EWMA (λ=0.94) | {fv(v.get('ewma'))} | Exponentially-weighted moving avg |")
+    lines.append(f"| GARCH(1,1) | {fv(v.get('garch'))} | 5-day-ahead conditional forecast |")
+    lines.append(f"| XGBoost ML | {fv(v.get('xgb'))} | Gradient boosting on lagged returns |")
+    lines.append(f"| Implied Vol (ATM) | {fv(v.get('iv'))} | BSM-inverted from market price |")
+    lines.append(f"| Model-Free IV | {fv(v.get('mfiv'))} | CBOE VIX-style, all strikes |")
+    lines.append("")
+
+    if v.get("iv") and v.get("garch"):
+        vg = (v["iv"] - v["garch"])/v["garch"]*100
+        lines.append(f"**Interpretation:** IV is **{vg:+.1f}%** relative to GARCH forecast.")
+        if vg > 15:
+            lines.append("→ Market pricing significantly higher risk than statistical models suggest. "
+                          "Options are **RICH**. Vol-selling strategies favoured.")
+        elif vg < -15:
+            lines.append("→ Market pricing significantly lower risk than statistical models suggest. "
+                          "Options are **CHEAP**. Vol-buying strategies favoured.")
+        else:
+            lines.append("→ Market pricing broadly consistent with statistical forecasts. No clear vol arbitrage.")
+    lines.append("")
+
+    # Section 3: Pricing Model Comparison
+    lines.append("## 3️⃣ PRICING MODEL COMPARISON")
+    lines.append("")
+    lines.append("| Model | Price | Assumption | Advantage |")
+    lines.append("|-------|-------|------------|-----------|")
+    lines.append(f"| **Black-Scholes-Merton** | {fp(pr.get('bsm'))} | Constant vol, no jumps | Closed-form, fast |")
+    lines.append(f"| **Binomial (American)** | {fp(pr.get('binom'))} | Discrete GBM | Handles early exercise |")
+    lines.append(f"| **Monte Carlo** | {fp(pr.get('mc'))} ± {pr.get('mc_se',0):.4f} | GBM paths, {pr.get('mc_paths',50000):,} sim | Flexible, path-dependent |")
+    lines.append(f"| **Heston Stochastic Vol** | {fp(pr.get('heston'))} | Mean-reverting vol | Captures vol smile |")
+    lines.append(f"| **Merton Jump-Diffusion** | {fp(pr.get('merton'))} | GBM + Poisson jumps | Captures tail risk |")
+    lines.append(f"| **Market Mid** | {fp(pr.get('market'))} | Bid/ask midpoint | Actual quoted price |")
+    lines.append("")
+
+    if pr.get("market") and pr.get("bsm"):
+        diff = (pr["market"] - pr["bsm"])/pr["bsm"]*100
+        lines.append(f"**Market vs BSM Divergence:** {diff:+.2f}%")
+        if abs(diff) > 5:
+            lines.append("→ Meaningful divergence between market and theoretical BSM price. "
+                          "Consider Heston/Jump models for a more accurate benchmark.")
+    lines.append("")
+
+    # Section 4: Greeks
+    lines.append("## 4️⃣ RISK SENSITIVITIES (GREEKS)")
+    lines.append("")
+    lines.append("### 4.1 First-Order Greeks")
+    lines.append("")
+    lines.append("| Greek | Symbol | Value | Interpretation |")
+    lines.append("|-------|--------|-------|----------------|")
+    lines.append(f"| Delta | Δ | {gk.get('delta',0):.4f} | {abs(gk.get('delta',0))*100:.1f}% probability proxy |")
+    lines.append(f"| Gamma | Γ | {gk.get('gamma',0):.6f} | Rate of change of Δ |")
+    lines.append(f"| Vega | ν | {gk.get('vega',0):.4f} | P&L per 1% vol move |")
+    lines.append(f"| Theta | Θ | {gk.get('theta',0):.4f}/day | Daily time decay |")
+    lines.append(f"| Rho | ρ | {gk.get('rho',0):.4f} | P&L per 1% rate move |")
+    lines.append("")
+    lines.append("### 4.2 Second-Order Greeks (Advanced)")
+    lines.append("")
+    lines.append("| Greek | Value | What It Measures |")
+    lines.append("|-------|-------|------------------|")
+    lines.append(f"| Vanna | {gk.get('vanna',0):.4f} | Change in Δ as vol changes |")
+    lines.append(f"| Volga (Vomma) | {gk.get('volga',0):.4f} | Convexity of Vega |")
+    lines.append(f"| Charm | {gk.get('charm',0):.4f} | Change in Δ as time passes |")
+    lines.append("")
+
+    # Section 5: Risk
+    lines.append("## 5️⃣ VALUE-AT-RISK ANALYSIS")
+    lines.append("")
+    lines.append(f"**Position Value:** {ccy}{rd.get('pos_val',100000):,} | **Confidence:** {rd.get('var_conf',0.95):.0%} | **Horizon:** 1 day")
+    lines.append("")
+    lines.append("| Metric | Parametric | Historical Simulation | Interpretation |")
+    lines.append("|--------|------------|----------------------|----------------|")
+    lines.append(f"| VaR | {ccy}{rk.get('param_var',0):,.0f} | {ccy}{rk.get('hist_var',0):,.0f} | Max loss expected |")
+    lines.append(f"| CVaR (Expected Shortfall) | {ccy}{rk.get('param_cvar',0):,.0f} | {ccy}{rk.get('hist_cvar',0):,.0f} | Avg loss beyond VaR |")
+    lines.append("")
+
+    # Section 6: Stress Test
+    if ss:
+        lines.append("## 6️⃣ STRESS TEST SCENARIOS")
+        lines.append("")
+        lines.append("| Scenario | Approx P&L | Exact P&L | Impact |")
+        lines.append("|----------|-----------|-----------|--------|")
+        for name, val in ss.items():
+            impact = "🟢 Profit" if val["exact_pnl"] > 0 else "🔴 Loss"
+            lines.append(f"| {name} | {ccy}{val['approx_pnl']:+.2f} | {ccy}{val['exact_pnl']:+.2f} | {impact} |")
         lines.append("")
 
-    lines.append("-" * 70)
-    lines.append("6. FINAL RECOMMENDATIONS")
-    lines.append("-" * 70)
-    if opt_verdict:
-        lines.append(f"OPTIONS: {opt_verdict}")
-        for n in opt_notes:
-            lines.append(f"  - {n}")
-        lines.append("")
-    lines.append(f"FUTURES: {fut_verdict}")
-    for n in fut_notes:
-        lines.append(f"  - {n}")
+    # Section 7: Futures
+    lines.append("## 7️⃣ FUTURES & FORWARD ANALYSIS")
     lines.append("")
-    lines.append("-" * 70)
-    lines.append("DISCLAIMER: This report is generated by transparent, rule-based heuristics")
-    lines.append("for educational purposes. It is NOT financial advice, does not account for")
-    lines.append("individual risk tolerance or portfolio context, and should not be the sole")
-    lines.append("basis for a real trade.")
-    lines.append("=" * 70)
+    lines.append("| Parameter | Value |")
+    lines.append("|-----------|-------|")
+    lines.append(f"| Spot | {ccy}{S:,.2f} |")
+    lines.append(f"| Theoretical Fair Forward | {ccy}{fd.get('theoretical',0):.2f} |")
+    lines.append(f"| Cost-of-Carry | {fd.get('carry',0):+.2%} |")
+    lines.append(f"| Term Structure | {'Contango' if fd.get('carry',0)>0 else 'Backwardation'} |")
+    lines.append("")
+
+    # Section 8: Backtest
+    if bt.get("df") is not None and not bt["df"].empty:
+        lines.append("## 8️⃣ WALK-FORWARD BACKTEST")
+        lines.append("")
+        lines.append("**Strategy:** Sell vol when EWMA > Historical × (1 + threshold)")
+        lines.append("")
+        lines.append("| Window | Signal | Train EWMA | Train Hist | Realized | P&L |")
+        lines.append("|--------|--------|-----------|------------|----------|-----|")
+        for _, row in bt["df"].iterrows():
+            lines.append(f"| W{int(row['window'])} | {row['signal']} | "
+                          f"{row.get('ewma_vol',0):.2%} | {row.get('hist_vol',0):.2%} | "
+                          f"{row.get('realized_vol',0):.2%} | {row.get('approx_pnl',0):+.4f} |")
+        lines.append("")
+        ps = bt.get("perf_stats", {})
+        if ps:
+            lines.append("**Performance Metrics:**")
+            lines.append("")
+            lines.append(f"- Sharpe Ratio: **{ps.get('sharpe',0):.2f}**")
+            lines.append(f"- Sortino Ratio: **{ps.get('sortino',0):.2f}**")
+            lines.append(f"- Calmar Ratio: **{ps.get('calmar',0):.2f}**")
+            lines.append(f"- Max Drawdown: **{ps.get('max_dd',0):.2%}**")
+            pv = ps.get("p_value", np.nan)
+            if not np.isnan(pv):
+                lines.append(f"- Bootstrap p-value: **{pv:.3f}** "
+                              f"({'✅ Statistically significant' if pv<0.05 else '⚠️ Not significant'})")
+        lines.append("")
+
+    # Section 9: Recommendations
+    lines.append("## 9️⃣ TRADING RECOMMENDATIONS")
+    lines.append("")
+    lines.append("### Options Strategy")
+    lines.append(f"**{rd.get('opt_verdict','N/A')}**")
+    lines.append("")
+    for n in rd.get("opt_notes", []):
+        lines.append(f"- {n}")
+    lines.append("")
+    lines.append("### Futures Strategy")
+    lines.append(f"**{rd.get('fut_verdict','N/A')}**")
+    lines.append("")
+    for n in rd.get("fut_notes", []):
+        lines.append(f"- {n}")
+    lines.append("")
+
+    # Disclaimer
+    lines.append("---")
+    lines.append("")
+    lines.append("## ⚠️ DISCLAIMER")
+    lines.append("")
+    lines.append("This report is generated by **QUANT EDGE**, an educational quantitative finance tool. "
+                  "All models, pricing outputs, risk metrics, and recommendations are for **research and "
+                  "educational purposes only**. They do not constitute investment advice, financial advice, "
+                  "trading advice, or any other sort of advice. Past performance is not indicative of future "
+                  "results. Options and futures trading involves substantial risk of loss and is not suitable "
+                  "for all investors. Please conduct your own research and consult with a qualified financial "
+                  "advisor before making any trading decisions.")
+    lines.append("")
+    lines.append(f"*QUANT EDGE Report ID: QE-{datetime.now().strftime('%Y%m%d-%H%M%S')} | "
+                  f"Generated {now}*")
 
     return "\n".join(lines)
 
-
-def parse_expiry_date(expiry_str: str) -> datetime:
-    """Handles both Yahoo's 'YYYY-MM-DD' and NSE India's 'DD-Mon-YYYY' expiry formats."""
-    s = str(expiry_str).strip()
-    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(s[:11] if fmt == "%d-%b-%Y" else s[:10], fmt)
-        except ValueError:
-            continue
-    return datetime.now() + timedelta(days=30)  # safe fallback so the app never crashes on a bad date string
-
-
 # =============================================================================
-# UPLOADED OPTIONS CHAIN — CSV/Excel parsing with auto column-mapping
+# PLOTLY STYLE HELPERS
 # =============================================================================
 
-COLUMN_ALIASES = {
-    "expiry": ["expiry", "expiry date", "expirydate", "exp date", "exp_date", "expiration"],
-    "strike": ["strike", "strike price", "strikeprice", "strk"],
-    "type": ["type", "option type", "opt type", "cp", "ce/pe", "instrument"],
-    "lastPrice": ["lastprice", "last price", "ltp", "close", "price", "close price"],
-    "bid": ["bid", "bid price", "bidprice", "bid qty x price", "buy price"],
-    "ask": ["ask", "ask price", "askprice", "offer", "sell price"],
-    "volume": ["volume", "vol", "traded volume", "totaltradedvolume", "contracts traded"],
-    "openInterest": ["openinterest", "open interest", "oi"],
-}
-
-
-def read_uploaded_chain(uploaded_file) -> pd.DataFrame:
-    """Reads a CSV or Excel file into a raw DataFrame, whatever its original column names are."""
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    return pd.read_excel(uploaded_file)
-
-
-def auto_map_columns(columns) -> dict:
-    """Best-effort match of uploaded column names to our required fields, so most files 'just work'."""
-    cols_lower = {str(c).strip().lower(): c for c in columns}
-    mapping = {}
-    for field, aliases in COLUMN_ALIASES.items():
-        found = None
-        for alias in aliases:
-            if alias in cols_lower:
-                found = cols_lower[alias]
-                break
-        if not found:
-            for alias in aliases:
-                match = next((orig for low, orig in cols_lower.items() if alias in low), None)
-                if match:
-                    found = match
-                    break
-        mapping[field] = found
-    return mapping
-
-
-def normalize_uploaded_chain(raw_df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
-    """Builds our standard [expiry, strike, type, lastPrice, bid, ask, volume, openInterest] schema from any uploaded file."""
-    out = pd.DataFrame()
-
-    expiry_col = col_map.get("expiry")
-    if expiry_col and expiry_col in raw_df.columns:
-        parsed = pd.to_datetime(raw_df[expiry_col], errors="coerce")
-        out["expiry"] = parsed.dt.strftime("%Y-%m-%d").fillna(raw_df[expiry_col].astype(str))
-    else:
-        out["expiry"] = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-
-    strike_col = col_map.get("strike")
-    out["strike"] = pd.to_numeric(raw_df[strike_col], errors="coerce") if strike_col in raw_df.columns else np.nan
-
-    type_col = col_map.get("type")
-    if type_col and type_col in raw_df.columns:
-        raw_type = raw_df[type_col].astype(str).str.strip().str.upper()
-        type_map = {"CE": "call", "CALL": "call", "C": "call", "PE": "put", "PUT": "put", "P": "put"}
-        out["type"] = raw_type.map(type_map).fillna(raw_type.str.lower())
-    else:
-        out["type"] = "call"
-
-    for field in ["lastPrice", "bid", "ask", "volume", "openInterest"]:
-        col = col_map.get(field)
-        out[field] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0.0) if col in raw_df.columns else 0.0
-
-    return out.dropna(subset=["strike"])
-
+def apply_pro_style(fig, title="", height=400, show_legend=True):
+    fig.update_layout(
+        template=PLOTLY_TEMPLATE,
+        height=height,
+        title=dict(text=title, font=dict(size=14, color="#e2e8f0"), x=0.02),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(21,27,43,0.5)",
+        font=dict(family="Inter, system-ui, sans-serif", size=11, color="#cbd5e1"),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="right", x=1,
+            bgcolor="rgba(21,27,43,0.7)", bordercolor="#1f2937", borderwidth=1,
+            font=dict(size=10),
+        ) if show_legend else dict(),
+        margin=dict(l=50, r=30, t=60, b=50),
+        hoverlabel=dict(
+            bgcolor="#151b2b", bordercolor="#6366f1",
+            font=dict(family="Inter", size=11, color="#e2e8f0")
+        ),
+        xaxis=dict(gridcolor="rgba(148,163,184,0.1)", zerolinecolor="rgba(148,163,184,0.2)"),
+        yaxis=dict(gridcolor="rgba(148,163,184,0.1)", zerolinecolor="rgba(148,163,184,0.2)"),
+    )
+    return fig
 
 # =============================================================================
-# 11. RECOMMENDATION ENGINE (rule-based, educational, transparent)
+# STREAMLIT UI — QUANT EDGE
 # =============================================================================
 
-def generate_options_recommendation(iv, forecast_vol, hist_vol, trend_signal, moneyness, days_to_expiry):
-    notes = []
-    score = 0
+st.set_page_config(
+    page_title="QUANT EDGE — Derivatives Analytics",
+    layout="wide",
+    page_icon="📊",
+    initial_sidebar_state="expanded",
+)
 
-    if not np.isnan(iv) and not np.isnan(forecast_vol) and forecast_vol > 0:
-        vol_gap = (iv - forecast_vol) / forecast_vol
-        if vol_gap > 0.15:
-            score -= 2
-            notes.append(f"Implied vol ({iv:.1%}) is {vol_gap:.0%} above the forecast ({forecast_vol:.1%}) "
-                          f"— options look **rich**. Favors premium-selling strategies over buying options outright.")
-        elif vol_gap < -0.15:
-            score += 2
-            notes.append(f"Implied vol ({iv:.1%}) is {abs(vol_gap):.0%} below the forecast ({forecast_vol:.1%}) "
-                          f"— options look **cheap**. Favors premium-buying strategies over selling.")
-        else:
-            notes.append(f"Implied vol ({iv:.1%}) is roughly in line with the forecast ({forecast_vol:.1%}) "
-                          f"— no strong mispricing signal either way.")
-    else:
-        notes.append("Not enough data to compare implied vs forecast volatility.")
-
-    if trend_signal == "up":
-        notes.append("Price is in a short-term uptrend (50-day MA above 200-day MA) — bullish directional bias.")
-        score += 1
-    elif trend_signal == "down":
-        notes.append("Price is in a short-term downtrend (50-day MA below 200-day MA) — bearish directional bias.")
-        score -= 1
-    else:
-        notes.append("No clear trend (50/200-day MAs are close together) — limited directional edge.")
-
-    if days_to_expiry < 14:
-        notes.append(f"Only {days_to_expiry} days to expiry — theta decay accelerates fast; "
-                      f"cuts against buying premium, favors selling it.")
-        score -= 1
-
-    if abs(moneyness - 1) > 0.1:
-        notes.append(f"Strike is {abs(moneyness - 1):.0%} away from spot — a directional, "
-                      f"lower-probability bet rather than a pure volatility trade.")
-
-    if score >= 2:
-        verdict = "LEAN: Consider BUYING options (vol looks cheap / setup favors long premium)"
-    elif score <= -2:
-        verdict = "LEAN: Consider SELLING options / premium (vol looks rich / setup favors short premium)"
-    else:
-        verdict = "LEAN: NEUTRAL — no strong edge either way"
-
-    return verdict, notes, score
-
-
-def generate_futures_recommendation(spot, theoretical_fwd, market_futures, rate, div_yield,
-                                     trend_signal, tau, ccy="$"):
-    notes = []
-    score = 0
-
-    carry = rate - div_yield
-    if carry > 0:
-        notes.append(f"Carry is positive (rate {rate:.2%} > dividend yield {div_yield:.2%}) — **contango**: "
-                      f"theoretical futures price ({ccy}{theoretical_fwd:.2f}) sits above spot ({ccy}{spot:.2f}).")
-    else:
-        notes.append(f"Carry is negative (dividend yield {div_yield:.2%} > rate {rate:.2%}) — **backwardation**: "
-                      f"theoretical futures price ({ccy}{theoretical_fwd:.2f}) sits below spot ({ccy}{spot:.2f}).")
-
-    arbitrage_flag = False
-    if market_futures and market_futures > 0:
-        mispricing = (market_futures - theoretical_fwd) / theoretical_fwd
-        if abs(mispricing) > 0.005:
-            arbitrage_flag = True
-            if mispricing > 0:
-                score += 2
-                notes.append(f"Market futures price ({ccy}{market_futures:.2f}) is {mispricing:+.2%} above fair value "
-                              f"— theoretically favors cash-and-carry (buy spot, sell futures), subject to real costs.")
-            else:
-                score -= 2
-                notes.append(f"Market futures price ({ccy}{market_futures:.2f}) is {mispricing:+.2%} below fair value "
-                              f"— theoretically favors reverse cash-and-carry (sell spot, buy futures).")
-        else:
-            notes.append(f"Market futures price ({ccy}{market_futures:.2f}) is close to fair value "
-                          f"({mispricing:+.2%}) — no meaningful carry arbitrage.")
-    else:
-        notes.append("No market futures quote supplied — reflects directional lean only, not carry-arbitrage.")
-
-    if trend_signal == "up":
-        score += 1
-        notes.append("Underlying uptrend (50>200 MA) — directional bias leans long futures.")
-    elif trend_signal == "down":
-        score -= 1
-        notes.append("Underlying downtrend (50<200 MA) — directional bias leans short futures.")
-    else:
-        notes.append("No clear trend — limited directional edge for futures.")
-
-    if arbitrage_flag:
-        verdict = "ARBITRAGE LEAN: BUY futures (sell spot)" if score > 0 else "ARBITRAGE LEAN: SELL futures (buy spot)"
-    elif score >= 2:
-        verdict = "LEAN: Consider LONG futures"
-    elif score <= -2:
-        verdict = "LEAN: Consider SHORT futures"
-    else:
-        verdict = "LEAN: NEUTRAL — no strong carry or trend edge"
-
-    return verdict, notes, score
-
-
-# =============================================================================
-# 12. STREAMLIT UI
-# =============================================================================
-
-st.set_page_config(page_title="Optika | Derivatives Intelligence", layout="wide", page_icon="◈")
-init_db()
-
-# --- Custom theme: typography, spacing, card styling ---
+# Professional dark theme CSS
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap');
+/* Global */
+.stApp {
+    background: linear-gradient(180deg, #0b0f1a 0%, #0f1729 100%);
+}
+.main .block-container {
+    padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1600px;
+}
 
-html, body, [class*="css"]  { font-family: 'Inter', -apple-system, sans-serif; }
+/* Brand */
+.qe-brand {
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 0 16px 0; border-bottom: 1px solid #1f2937; margin-bottom: 16px;
+}
+.qe-logo {
+    font-size: 1.9rem; font-weight: 900; letter-spacing: -0.5px;
+    background: linear-gradient(135deg, #6366f1 0%, #22d3ee 50%, #10b981 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    line-height: 1;
+}
+.qe-tagline {
+    color: #64748b; font-size: 0.72rem; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 1.5px; margin-top: 4px;
+}
 
-.optika-hero {
-    background: linear-gradient(135deg, #0f1729 0%, #1a2744 55%, #22315a 100%);
-    padding: 34px 40px; border-radius: 16px; margin-bottom: 24px;
-    box-shadow: 0 8px 24px rgba(15, 23, 41, 0.18);
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0f1729 0%, #0b0f1a 100%);
+    border-right: 1px solid #1f2937;
 }
-.optika-hero h1 {
-    color: #ffffff; margin: 0; font-size: 2.4rem; font-weight: 700;
-    letter-spacing: -0.02em; display: flex; align-items: center; gap: 12px;
+[data-testid="stSidebar"] .stMarkdown h3 {
+    color: #a78bfa; font-size: 0.75rem; text-transform: uppercase;
+    letter-spacing: 1.5px; font-weight: 700; margin-top: 20px; margin-bottom: 8px;
+    border-left: 3px solid #6366f1; padding-left: 8px;
 }
-.optika-hero .logo-mark {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 44px; height: 44px; border-radius: 12px;
-    background: linear-gradient(135deg, #5b8def 0%, #7c5cff 100%);
-    font-size: 1.5rem; font-weight: 700; color: white;
-}
-.optika-hero p {
-    color: #a9b6d4; margin: 10px 0 0 0; font-size: 1.02rem; max-width: 720px; line-height: 1.5;
-}
-.optika-badge {
-    display: inline-block; background: rgba(124, 92, 255, 0.15); color: #b8a9ff;
-    padding: 3px 11px; border-radius: 20px; font-size: 0.75rem; font-weight: 600;
-    margin-top: 14px; letter-spacing: 0.03em; border: 1px solid rgba(124, 92, 255, 0.3);
-}
+
+/* Metrics */
 [data-testid="stMetric"] {
-    background: #f8f9fc; border: 1px solid #e8eaf0; border-radius: 12px;
-    padding: 14px 16px 10px 16px;
+    background: linear-gradient(135deg, #151b2b 0%, #1a2138 100%);
+    padding: 14px 16px; border-radius: 10px;
+    border: 1px solid #1f2937;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    transition: transform 0.2s, border-color 0.2s;
 }
-[data-testid="stMetricLabel"] { font-weight: 500; color: #5a6478; }
-.stTabs [data-baseweb="tab-list"] { gap: 4px; }
-.stTabs [data-baseweb="tab"] {
-    border-radius: 8px 8px 0 0; padding: 10px 16px; font-weight: 500;
+[data-testid="stMetric"]:hover {
+    transform: translateY(-2px); border-color: #6366f1;
 }
-footer, #MainMenu { visibility: hidden; }
-.optika-footer {
-    text-align: center; color: #9aa3b5; font-size: 0.82rem; margin-top: 48px;
-    padding-top: 20px; border-top: 1px solid #eaecf0;
+[data-testid="stMetricLabel"] {
+    color: #94a3b8 !important; font-size: 0.7rem !important;
+    text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600;
+}
+[data-testid="stMetricValue"] {
+    color: #f1f5f9 !important; font-size: 1.35rem !important; font-weight: 700 !important;
+}
+[data-testid="stMetricDelta"] { font-size: 0.75rem !important; font-weight: 600; }
+
+/* Buttons */
+.stButton > button {
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+    border: none; color: white; font-weight: 600;
+    padding: 10px 24px; border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(99,102,241,0.3);
+    transition: all 0.2s;
+}
+.stButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(99,102,241,0.5);
 }
 
-/* --- Section headers: consistent branded accent instead of plain markdown h3 --- */
-h3 {
-    font-weight: 700 !important; color: #1a1a2e !important; letter-spacing: -0.01em;
-    padding-left: 12px; border-left: 4px solid #7c5cff; margin-top: 28px !important;
-}
-h4 { font-weight: 600 !important; color: #2a2f45 !important; }
-
-/* --- Primary buttons: brand gradient instead of default red --- */
-.stButton > button[kind="primary"], .stDownloadButton > button {
-    background: linear-gradient(135deg, #5b8def 0%, #7c5cff 100%) !important;
-    border: none !important; font-weight: 600 !important; color: white !important;
-    box-shadow: 0 2px 8px rgba(124, 92, 255, 0.25) !important;
-}
-.stButton > button[kind="primary"]:hover, .stDownloadButton > button:hover {
-    box-shadow: 0 4px 14px rgba(124, 92, 255, 0.38) !important; transform: translateY(-1px);
-}
-.stButton > button:not([kind="primary"]) {
-    border-radius: 8px !important; font-weight: 500 !important;
+/* Section headers */
+.qe-section {
+    background: linear-gradient(90deg, rgba(99,102,241,0.15) 0%, transparent 100%);
+    border-left: 4px solid #6366f1; padding: 12px 16px;
+    margin: 16px 0 12px 0; border-radius: 4px;
+    font-weight: 700; font-size: 1.1rem; color: #e2e8f0;
 }
 
-/* --- Tabs: branded underline instead of default red --- */
-.stTabs [data-baseweb="tab"][aria-selected="true"] {
-    color: #7c5cff !important; font-weight: 600 !important;
+/* Badges */
+.qe-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 10px; border-radius: 12px; font-size: 0.7rem;
+    font-weight: 600; margin: 2px 4px 2px 0;
 }
-.stTabs [data-baseweb="tab-highlight"] { background-color: #7c5cff !important; }
-.stTabs [data-baseweb="tab-border"] { background-color: #eaecf0 !important; }
+.badge-live { background: rgba(16,185,129,0.15); color: #6ee7b7; border: 1px solid #10b981; }
+.badge-delayed { background: rgba(245,158,11,0.15); color: #fcd34d; border: 1px solid #f59e0b; }
+.badge-nse { background: rgba(249,115,22,0.15); color: #fdba74; border: 1px solid #f97316; }
+.badge-synth { background: rgba(107,114,128,0.15); color: #cbd5e1; border: 1px solid #6b7280; }
 
-/* --- Radio / segmented controls --- */
-div[role="radiogroup"] label {
-    background: #f8f9fc; border: 1px solid #e8eaf0; border-radius: 8px;
-    padding: 6px 14px; margin-right: 6px !important;
-}
-
-/* --- Data editor / dataframe polish --- */
-[data-testid="stDataFrame"], [data-testid="stDataEditor"] {
-    border-radius: 10px; overflow: hidden; border: 1px solid #e8eaf0;
+/* Dataframe */
+[data-testid="stDataFrame"] {
+    border: 1px solid #1f2937; border-radius: 8px; overflow: hidden;
 }
 
-/* --- Slider accent --- */
-.stSlider [role="slider"] { background-color: #7c5cff !important; }
-
-/* --- Sidebar polish --- */
-[data-testid="stSidebar"] { background: #fafbfd; border-right: 1px solid #eaecf0; }
-[data-testid="stSidebar"] h3 { border-left: none; padding-left: 0; color: #7c5cff !important; }
-
-/* --- Alert boxes: rounded, softer borders --- */
-[data-testid="stAlert"] { border-radius: 10px; }
-
-/* --- Selectbox / input focus accent --- */
-.stSelectbox [data-baseweb="select"]:focus-within,
-.stTextInput input:focus, .stNumberInput input:focus {
-    border-color: #7c5cff !important; box-shadow: 0 0 0 1px #7c5cff !important;
+/* Radio (nav) */
+[data-testid="stSidebar"] [role="radiogroup"] label {
+    background: rgba(21,27,43,0.5); border: 1px solid #1f2937;
+    padding: 10px 14px; border-radius: 8px; margin: 3px 0;
+    transition: all 0.15s; width: 100%;
 }
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {
+    background: rgba(99,102,241,0.1); border-color: #6366f1;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label[data-checked="true"] {
+    background: linear-gradient(90deg, rgba(99,102,241,0.3), rgba(99,102,241,0.05));
+    border-color: #6366f1; box-shadow: 0 0 0 1px #6366f1;
+}
+
+/* Input */
+.stTextInput input, .stNumberInput input, .stSelectbox > div > div {
+    background: rgba(21,27,43,0.8) !important;
+    border: 1px solid #1f2937 !important;
+    color: #f1f5f9 !important;
+}
+
+/* Info/warning boxes */
+.stAlert {
+    background: rgba(21,27,43,0.8) !important;
+    border: 1px solid #1f2937 !important;
+    border-left: 4px solid #6366f1 !important;
+}
+
+/* Divider */
+hr { border-color: #1f2937 !important; margin: 20px 0 !important; }
+
+/* Hide streamlit branding for clean look */
+#MainMenu, footer, header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- Hero header ---
+# =============================================================================
+# BRAND HEADER (main area)
+# =============================================================================
+
 st.markdown("""
-<div class="optika-hero">
-    <h1><span class="logo-mark">Ø</span> Optika</h1>
-    <p>A quantitative derivatives intelligence engine — live options &amp; futures pricing, volatility
-    forecasting, hedging simulation, and risk analytics for global tickers and NSE-listed Indian equities.</p>
-    <span class="optika-badge">EDUCATIONAL TOOL · NOT FINANCIAL ADVICE</span>
+<div class="qe-brand">
+  <div>
+    <div class="qe-logo">📊 QUANT EDGE</div>
+    <div class="qe-tagline">Institutional Derivatives Analytics · Real-Time Multi-Source</div>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
-# --- About / methodology sidebar ---
+# =============================================================================
+# SIDEBAR — Brand, Navigation, Search, Config
+# =============================================================================
+
 with st.sidebar:
-    st.markdown("### ◈ About Optika")
-    st.markdown(
-        "Optika prices and risk-manages options and futures using classical and modern "
-        "quantitative finance methods, cross-checked against live market data."
-    )
-    st.markdown("**Pricing models**")
-    st.markdown("- Black-Scholes-Merton (closed-form)\n- Binomial tree (American exercise)\n"
-                "- Monte Carlo simulation\n- Heston (stochastic volatility)\n- Merton (jump-diffusion)")
-    st.markdown("**Volatility**")
-    st.markdown("- Historical, EWMA, GARCH(1,1)\n- Random Forest ML forecast\n"
-                "- Implied vol (Brent inversion)\n- Model-free (VIX-style) IV\n- Full 3D vol surface")
-    st.markdown("**Risk & hedging**")
-    st.markdown("- 1st & 2nd-order Greeks\n- Dynamic delta-hedging\n"
-                "- Parametric & historical VaR/CVaR\n- Scenario stress testing")
-    st.markdown("**Data sources**")
-    st.markdown("Yahoo Finance (primary) → NSE India (fallback for Indian equities) → Stooq (fallback)")
+    # Brand
+    st.markdown("""
+    <div style="text-align:center; padding: 8px 0 16px 0;
+                 border-bottom: 1px solid #1f2937; margin-bottom: 12px;">
+      <div style="font-size: 1.6rem; font-weight: 900; letter-spacing: -0.5px;
+                   background: linear-gradient(135deg, #6366f1, #22d3ee, #10b981);
+                   -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+        📊 QUANT EDGE
+      </div>
+      <div style="color: #64748b; font-size: 0.65rem; text-transform: uppercase;
+                   letter-spacing: 1.2px; margin-top: 4px;">
+        DERIVATIVES ANALYTICS
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Search
+    st.markdown("### 🔍 Instrument")
+    raw_query = st.text_input(
+        "Search", value="",
+        placeholder="Reliance, TCS, AAPL, ^NSEI...",
+        key="main_search", label_visibility="collapsed").strip()
+
+    ticker_input = None
+    if raw_query:
+        candidates = search_ticker_live(raw_query)
+        if candidates:
+            labels = [c[1] for c in candidates]
+            symbols = [c[0] for c in candidates]
+            chosen = st.selectbox("Match:", labels, index=0,
+                                    key="ticker_select", label_visibility="collapsed")
+            ticker_input = symbols[labels.index(chosen)]
+    else:
+        pop_labels = [p[1] for p in POPULAR_TICKERS]
+        pop_symbols = [p[0] for p in POPULAR_TICKERS]
+        chosen_pop = st.selectbox("Quick pick:", pop_labels, index=0,
+                                    key="popular_select", label_visibility="collapsed")
+        ticker_input = pop_symbols[pop_labels.index(chosen_pop)]
+
+    run_btn = st.button("▶  ANALYSE", type="primary", use_container_width=True)
+
     st.markdown("---")
-    st.caption("Built with Python, Streamlit, SciPy, scikit-learn & Plotly. All recommendations are "
-               "transparent rule-based heuristics for learning purposes — not investment advice.")
 
-# --- Search bar (company name OR ticker) ---
-col_search, col_go = st.columns([4, 1])
-with col_search:
-    query = st.text_input("🔍 Search by company name or ticker (e.g. Apple, Reliance, ICICI Bank, TCS, SPY)",
-                           value="Reliance").strip()
-with col_go:
-    st.write("")
-    st.write("")
-    run = st.button("Run Analysis", type="primary")
+    # Navigation — the requested left-panel nav
+    st.markdown("### 🧭 Navigation")
+    section = st.radio(
+        "Section", [
+            "🎯 Overview",
+            "📊 Pricing & Volatility",
+            "🏛️ Greeks",
+            "🌐 Volatility Surface",
+            "🔮 Forecasting",
+            "🎨 Strategies",
+            "🛡️ Hedging",
+            "📦 Futures",
+            "⚠️ Risk",
+            "🔁 Backtest",
+            "📋 Report",
+        ],
+        label_visibility="collapsed",
+        key="nav_section",
+    )
 
-ticker_input = None
-if query:
-    candidates = search_ticker(query)
-    if len(candidates) > 1:
-        labels = [c[1] for c in candidates]
-        chosen_label = st.selectbox("Did you mean:", labels, index=0)
-        ticker_input = candidates[labels.index(chosen_label)][0]
-    elif candidates:
-        ticker_input = candidates[0][0]
-        st.caption(f"Matched to **{candidates[0][1]}**")
+    st.markdown("---")
 
-if run or ticker_input:
-    with st.spinner("Fetching live data (Yahoo Finance, with NSE India / Stooq fallback)..."):
-        spot, hist, source = get_spot_and_history(ticker_input)
+    # Configuration
+    st.markdown("### ⚙️ Configuration")
+    n_mc = st.select_slider("Monte Carlo paths",
+                              [10_000,25_000,50_000,100_000], value=50_000)
+    bsteps = st.select_slider("Binomial tree steps",
+                                [100,200,300,500], value=200)
+    var_conf = st.slider("VaR confidence level", 0.90, 0.99, 0.95, 0.01)
+    pos_val = st.number_input("Position notional", 10_000, 10_000_000, 100_000, 10_000)
+    rehedge_n = st.slider("Rehedge every N steps", 1, 10, 1)
+    hedge_cost = st.slider("Transaction cost (bps)", 0, 50, 5)
 
-    if spot is None:
-        st.error(f"Couldn't find data for '{ticker_input}' from any source (Yahoo, NSE India, Stooq). "
-                 f"Check the ticker/spelling and try again — for Indian stocks, try the NSE suffix "
-                 f"e.g. `RELIANCE.NS`.")
-        st.stop()
+    with st.expander("Advanced models"):
+        heston_on = st.checkbox("Heston stochastic vol", value=True)
+        merton_on = st.checkbox("Merton jump-diffusion", value=True)
+        xgb_on = st.checkbox("XGBoost vol forecast", value=True)
+        surf_exp = st.slider("Expiries for vol surface", 1, 8, 3)
 
-    rate = get_risk_free_rate(ticker_input)
-    div_yield = get_dividend_yield(ticker_input, spot)
-    ccy = get_currency_symbol(ticker_input)
+    with st.expander("🔑 API Keys (optional)"):
+        polygon_key = st.text_input("Polygon.io", value="", type="password")
+        av_key = st.text_input("Alpha Vantage", value="", type="password")
+        td_key = st.text_input("Twelve Data", value="", type="password")
 
-    st.subheader(f"{ticker_input} — Spot: {ccy}{spot:,.2f}  |  Rate: {rate:.2%}  |  Div yield: {div_yield:.2%}")
-    st.caption(f"📡 Data source: **{source}**" +
-               (" — NSE India live fallback (limited history)" if "NSE" in source else ""))
+    with st.expander("🔧 Debug"):
+        show_debug = st.checkbox("Show data source log", value=False)
 
-    expiries, exp_source, exp_note = get_expiries(ticker_input)
+    st.markdown("---")
+    st.caption("💡 QUANT EDGE v3.0")
 
-    tabs = st.tabs(["📈 Pricing & Volatility", "🌋 Vol Surface & Forecasting", "🧬 Advanced Models",
-                     "🧮 Strategy Builder", "🛡️ Risk & Hedging", "📊 Backtest & Track Record",
-                     "🎯 Final Recommendation"])
+# =============================================================================
+# MAIN — Run analysis
+# =============================================================================
 
-    # Shared state across tabs
-    have_options = bool(expiries)
-    expiry = strike = option_type = tau = None
-    h_vol = e_vol = g_vol = iv = np.nan
-    vol_for_pricing = np.nan
-    chain = pd.DataFrame()
+if not (run_btn or raw_query) or not ticker_input:
+    # Landing
+    st.markdown("""
+    <div style="text-align: center; padding: 60px 20px;">
+      <div style="font-size: 4rem; margin-bottom: 20px;">📊</div>
+      <h2 style="color: #e2e8f0; font-weight: 700;">Welcome to QUANT EDGE</h2>
+      <p style="color: #94a3b8; font-size: 1.05rem; max-width: 600px; margin: 20px auto;">
+        Institutional-grade derivatives analytics with real-time multi-source data,
+        advanced pricing models, and comprehensive risk analysis.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    for col, (icon, title, desc) in zip([c1,c2,c3,c4], [
+        ("🌐", "Multi-Source", "NSE India · Yahoo · CBOE · Stooq · Polygon"),
+        ("💎", "5 Pricing Models", "BSM · Binomial · Monte Carlo · Heston · Merton"),
+        ("📈", "Advanced Vol", "Historical · EWMA · GARCH · XGBoost · Model-Free"),
+        ("🛡️", "Full Risk Suite", "Greeks · VaR/CVaR · Stress · Backtest"),
+    ]):
+        col.markdown(f"""
+        <div style="background: linear-gradient(135deg, #151b2b, #1a2138);
+                     border: 1px solid #1f2937; border-radius: 12px;
+                     padding: 24px 20px; text-align: center; height: 160px;">
+          <div style="font-size: 2.2rem; margin-bottom: 8px;">{icon}</div>
+          <div style="color: #a78bfa; font-weight: 700; font-size: 0.95rem;
+                       margin-bottom: 8px;">{title}</div>
+          <div style="color: #94a3b8; font-size: 0.78rem;">{desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.info("👈 **Search an instrument** in the left sidebar and click **▶ ANALYSE** to begin.")
+    st.stop()
+
+# ── Load data ──────────────────────────────────────────────────────────────
+with st.spinner(f"Loading {ticker_input}..."):
+    spot_h, hist, hist_src = get_spot_and_history(ticker_input, av_key, td_key)
+
+if spot_h is None or hist is None:
+    st.error(f"❌ No data available for **{ticker_input}**. Try a different instrument.")
+    st.stop()
+
+rt_spot, rt_src = get_realtime_spot(ticker_input, polygon_key, av_key, td_key)
+spot = rt_spot if rt_spot else spot_h
+rt_src = rt_src if rt_spot else f"{hist_src} (last close)"
+
+rate = get_risk_free_rate()
+div_yield = get_dividend_yield(ticker_input, spot)
+ccy = get_currency_symbol(ticker_input)
+
+with st.spinner("Fetching options chain..."):
+    exps_all, chains_all, opt_src, is_synth, debug_log, nse_spot = \
+        get_options_data(ticker_input, polygon_key)
+
+if nse_spot and nse_spot > 0:
+    spot = float(nse_spot)
+    rt_src = "NSE India (option chain)"
+
+if is_synth or exps_all is None:
+    hv_pre = historical_vol(hist["log_return"])
+    exps_all, chains_all = _synthetic_chain(spot, rate, div_yield, hv_pre or 0.25)
+    opt_src = "Synthetic (BSM)"
+    is_synth = True
+
+# ── Top data strip ─────────────────────────────────────────────────────────
+top_c1, top_c2, top_c3, top_c4, top_c5, top_c6 = st.columns([1.5, 1, 1, 1, 1, 1.5])
+top_c1.metric("Spot", f"{ccy}{spot:,.2f}")
+top_c2.metric("Risk-Free", f"{rate:.2%}")
+top_c3.metric("Div Yield", f"{div_yield:.2%}")
+top_c4.metric("Expiries", len(exps_all))
+top_c5.metric("History", f"{len(hist)}d")
+top_c6.metric("Updated", datetime.now().strftime("%H:%M:%S"))
+
+# Source badges
+rt_badge = "badge-nse" if "NSE" in rt_src else ("badge-live" if rt_spot else "badge-delayed")
+opt_badge = ("badge-nse" if "NSE" in opt_src
+             else "badge-synth" if is_synth else "badge-live")
+st.markdown(f"""
+<div style="margin: 8px 0 12px 0;">
+  <span class="qe-badge {rt_badge}">📡 Price · {rt_src}</span>
+  <span class="qe-badge {opt_badge}">📋 Options · {opt_src}</span>
+  <span class="qe-badge badge-live">💱 {ccy}{ticker_input}</span>
+</div>
+""", unsafe_allow_html=True)
+
+if show_debug and debug_log:
+    with st.expander("🔧 Data Source Log", expanded=False):
+        for line in debug_log:
+            st.text(line)
+
+if is_synth:
+    st.warning("⚠️ **Synthetic chain in use.** For real options data try: "
+                "RELIANCE.NS, TCS.NS, ^NSEI (NSE); AAPL, MSFT, SPY, TSLA (US).")
+
+# ── Contract selectors ─────────────────────────────────────────────────────
+sc1, sc2, sc3 = st.columns(3)
+with sc1:
+    expiry = st.selectbox("📅 Expiry", exps_all, index=min(2, len(exps_all)-1))
+chain = chains_all.get(expiry, pd.DataFrame())
+strikes = sorted(chain["strike"].unique().tolist()) if not chain.empty else []
+def_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i]-spot)) if strikes else 0
+with sc2:
+    strike = float(st.selectbox("💵 Strike", strikes, index=def_idx)
+                    if strikes else st.number_input("Strike", value=float(spot)))
+with sc3:
+    option_type = st.selectbox("📝 Type", ["call", "put"])
+
+tau = max((datetime.strptime(expiry,"%Y-%m-%d")-datetime.now()).days, 1) / 365
+pc_col = "mid_price" if (not chain.empty and "mid_price" in chain.columns) else "lastPrice"
+if not chain.empty:
+    rs = chain[(chain["strike"]==strike) & (chain["type"]==option_type)]
+    market_price = (float(rs[pc_col].iloc[0])
+                     if (not rs.empty and pc_col in rs.columns
+                         and not pd.isna(rs[pc_col].iloc[0])) else np.nan)
+else:
     market_price = np.nan
-    trend = "flat"
 
-    hist["ma50"] = hist["Close"].rolling(50).mean()
-    hist["ma200"] = hist["Close"].rolling(200).mean()
-    valid_ma = hist.dropna(subset=["ma50", "ma200"])
-    if len(valid_ma) > 0:
-        trend = "up" if valid_ma["ma50"].iloc[-1] > valid_ma["ma200"].iloc[-1] else "down"
-
+# ── Compute all metrics ─────────────────────────────────────────────────────
+with st.spinner("Computing analytics..."):
     h_vol = historical_vol(hist["log_return"])
     e_vol = ewma_vol(hist["log_return"])
+    g_vol = garch_forecast_vol(hist["log_return"])
+    x_vol = xgboost_vol_forecast(hist["log_return"]) if xgb_on else np.nan
+    iv = implied_vol(market_price, spot, strike, rate, div_yield, tau, option_type)
+    vol_fp = iv if not np.isnan(iv) else (g_vol if not np.isnan(g_vol) else (h_vol or 0.25))
+    mfiv = model_free_iv(chain, spot, rate, tau) if not chain.empty else np.nan
+    pcr_oi, pcr_vol = calculate_pcr(chain) if not chain.empty else (None, None)
 
-    # Pre-declared with safe defaults so the report generator (after all tabs)
-    # never hits a NameError, regardless of which code paths actually ran.
-    ml_vol, ml_r2, mf_iv = np.nan, np.nan, np.nan
-    bsm_p = binom_p = mc_p = np.nan
-    greeks1 = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
-    greeks2 = {"vanna": 0.0, "volga": 0.0, "charm": 0.0}
-    heston_p = jump_p = None
-    hedge_pnl = None
-    bt_stats = {}
-    opt_verdict, opt_notes = None, []
-    fut_verdict, fut_notes = None, []
+    bsm_p = bsm_price(spot, strike, rate, div_yield, vol_fp, tau, option_type)
+    binom_p = binomial_price(spot, strike, rate, div_yield, vol_fp, tau,
+                               option_type, "american", bsteps)
+    mc_p, mc_err = monte_carlo_price(spot, strike, rate, div_yield,
+                                       vol_fp, tau, option_type, n_mc)
 
-    # ---------------- TAB 1: Pricing & Volatility ----------------
-    with tabs[0]:
-        st.markdown("#### 📝 Options Data Source")
-        data_mode = st.radio(
-            "Choose how options data is provided for this ticker",
-            ["Auto-fetch (Yahoo Finance → NSE India)", "Upload CSV/Excel or enter manually"],
-            index=1 if not have_options else 0,
-            horizontal=True,
-            key=f"data_mode_{ticker_input}",
-            label_visibility="collapsed",
-        )
+    heston_p = np.nan; h_params = {}
+    if heston_on and not chain.empty:
+        sd = []
+        for _, rr in chain[chain["type"]==option_type].iterrows():
+            mp2 = rr.get(pc_col, np.nan)
+            if pd.isna(mp2) or mp2 <= 0: continue
+            iv2 = implied_vol(mp2, spot, float(rr["strike"]), rate, div_yield, tau, option_type)
+            if not np.isnan(iv2) and 0.01 < iv2 < 3:
+                sd.append((float(rr["strike"]), iv2))
+        h_params = (calibrate_heston(spot, rate, div_yield, tau,
+                                       [x[0] for x in sd], [x[1] for x in sd], option_type)
+                     if len(sd) >= 3
+                     else {"v0":vol_fp**2,"kappa":2.0,"theta":vol_fp**2,
+                             "sigma_v":0.3,"rho":-0.5})
+        heston_p = heston_price(spot, strike, rate, div_yield, tau,
+                                 h_params["v0"], h_params["kappa"], h_params["theta"],
+                                 h_params["sigma_v"], h_params["rho"], option_type)
+    merton_p = (merton_jump_price(spot, strike, rate, div_yield, vol_fp, tau,
+                                    opt=option_type) if merton_on else np.nan)
 
-        manual_chain_all = None
-        if data_mode == "Upload CSV/Excel or enter manually":
-            state_key = f"manual_chain_{ticker_input}"
+    greeks = bsm_greeks(spot, strike, rate, div_yield, vol_fp, tau, option_type)
+    hist["ma50"] = hist["Close"].rolling(50).mean()
+    hist["ma200"] = hist["Close"].rolling(200).mean()
+    lma = hist.dropna(subset=["ma50","ma200"])
+    trend = ("up" if not lma.empty and lma.iloc[-1]["ma50"] > lma.iloc[-1]["ma200"]
+              else ("down" if not lma.empty else "flat"))
+    var_dict = calculate_var_cvar(hist["log_return"], var_conf, 1, pos_val)
+    fwd = theoretical_forward_price(spot, rate, div_yield, tau)
 
-            uploaded_file = st.file_uploader(
-                "Upload an options chain (CSV or Excel — e.g. exported from your broker or NSE's website)",
-                type=["csv", "xlsx", "xls"], key=f"uploader_{ticker_input}",
-            )
+st.markdown("---")
 
-            if uploaded_file is not None:
-                try:
-                    raw_df = read_uploaded_chain(uploaded_file)
-                    col_map = auto_map_columns(raw_df.columns)
+# =============================================================================
+# SECTION RENDERING
+# =============================================================================
 
-                    with st.expander("Column mapping (auto-detected — adjust if anything looks wrong)", expanded=False):
-                        cols_available = ["(none)"] + list(raw_df.columns)
-                        new_map = {}
-                        for field in ["expiry", "strike", "type", "lastPrice", "bid", "ask", "volume", "openInterest"]:
-                            default = col_map.get(field) or "(none)"
-                            default_idx = cols_available.index(default) if default in cols_available else 0
-                            chosen = st.selectbox(field, cols_available, index=default_idx, key=f"map_{field}_{ticker_input}")
-                            new_map[field] = None if chosen == "(none)" else chosen
-                        col_map = new_map
+if section == "🎯 Overview":
+    st.markdown('<div class="qe-section">🎯 Executive Overview</div>', unsafe_allow_html=True)
 
-                    normalized = normalize_uploaded_chain(raw_df, col_map)
-                    if normalized.empty:
-                        st.error("Couldn't parse any valid rows (need at least a Strike column with numeric values). "
-                                 "Check the column mapping above.")
-                    else:
-                        st.session_state[state_key] = normalized
-                        st.success(f"Loaded {len(normalized)} contracts from '{uploaded_file.name}'. "
-                                   f"Review/edit below before analyzing.")
-                except Exception as e:
-                    st.error(f"Couldn't read this file ({type(e).__name__}). Make sure it's a valid CSV or Excel file.")
+    # KPI cards
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Implied Vol", f"{iv:.1%}" if not np.isnan(iv) else "N/A")
+    k2.metric("BSM Price", f"{ccy}{bsm_p:.4f}")
+    k3.metric("Delta", f"{greeks['delta']:.4f}")
+    k4.metric("Theta/day", f"{greeks['theta']:.4f}")
 
-            if state_key not in st.session_state:
-                st.session_state[state_key] = pd.DataFrame({
-                    "expiry": [(datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")] * 2,
-                    "strike": [round(spot * 0.95, 2), round(spot * 1.05, 2)],
-                    "type": ["call", "put"],
-                    "lastPrice": [0.0, 0.0],
-                    "bid": [0.0, 0.0],
-                    "ask": [0.0, 0.0],
-                    "volume": [0, 0],
-                    "openInterest": [0, 0],
-                })
+    # Price chart with MA overlay
+    st.markdown("### Price Trajectory")
+    fig_px = go.Figure()
+    fig_px.add_trace(go.Scatter(x=hist.index, y=hist["Close"], name="Close",
+                                  line=dict(color=PALETTE["primary"], width=2),
+                                  fill="tozeroy", fillcolor="rgba(99,102,241,0.05)"))
+    fig_px.add_trace(go.Scatter(x=hist.index, y=hist["ma50"], name="MA 50",
+                                  line=dict(color=PALETTE["warning"], width=1.5, dash="dot")))
+    fig_px.add_trace(go.Scatter(x=hist.index, y=hist["ma200"], name="MA 200",
+                                  line=dict(color=PALETTE["danger"], width=1.5, dash="dash")))
+    apply_pro_style(fig_px, f"{ticker_input} — Price History with Moving Averages", 420)
+    st.plotly_chart(fig_px, use_container_width=True)
 
-            st.caption("Review or edit the table below (uploaded rows are pre-filled here) — Strike, Type, "
-                       "Expiry, and Last Price are required; Bid/Ask/Volume/OI are optional but improve accuracy.")
-            edited = st.data_editor(
-                st.session_state[state_key],
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "expiry": st.column_config.TextColumn("Expiry (YYYY-MM-DD)"),
-                    "strike": st.column_config.NumberColumn("Strike", format="%.2f"),
-                    "type": st.column_config.SelectboxColumn("Type", options=["call", "put"]),
-                    "lastPrice": st.column_config.NumberColumn("Last Price", format="%.2f"),
-                    "bid": st.column_config.NumberColumn("Bid", format="%.2f"),
-                    "ask": st.column_config.NumberColumn("Ask", format="%.2f"),
-                    "volume": st.column_config.NumberColumn("Volume"),
-                    "openInterest": st.column_config.NumberColumn("Open Interest"),
-                },
-                key=f"editor_{ticker_input}",
-            )
-            st.session_state[state_key] = edited
+    # Signals
+    ov, on_notes, _ = rec_options(iv, g_vol if not np.isnan(g_vol) else e_vol,
+                                     h_vol, trend, strike/spot, int(tau*365), pcr_oi)
+    fv_sig, fn_notes, _ = rec_futures(spot, fwd, 0.0, rate, div_yield, trend, tau, ccy)
 
-            manual_chain_all = edited.dropna(subset=["strike", "type", "expiry"]).copy()
-            manual_chain_all = manual_chain_all[manual_chain_all["strike"] > 0]
-            if not manual_chain_all.empty:
-                manual_chain_all["strike"] = manual_chain_all["strike"].astype(float)
-                manual_chain_all["lastPrice"] = pd.to_numeric(manual_chain_all["lastPrice"], errors="coerce").fillna(0.0)
-                manual_chain_all["expiry"] = manual_chain_all["expiry"].astype(str)
-                expiries = sorted(manual_chain_all["expiry"].unique())
-                exp_source = "Manual Entry"
-                have_options = True
-            else:
-                have_options = False
+    st.markdown("### Trading Signals")
+    sig_c1, sig_c2 = st.columns(2)
+    with sig_c1:
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #151b2b, #1a2138);
+                     border: 1px solid #1f2937; border-left: 4px solid #6366f1;
+                     border-radius: 8px; padding: 20px;">
+          <div style="color: #a78bfa; font-size: 0.75rem; font-weight: 700;
+                       text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">
+            📊 OPTIONS
+          </div>
+          <div style="color: #f1f5f9; font-size: 1.2rem; font-weight: 700; margin-bottom: 12px;">
+            {ov}
+          </div>
+          <div style="color: #94a3b8; font-size: 0.85rem; line-height: 1.5;">
+            {"<br>• ".join([""] + on_notes)}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with sig_c2:
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #151b2b, #1a2138);
+                     border: 1px solid #1f2937; border-left: 4px solid #22d3ee;
+                     border-radius: 8px; padding: 20px;">
+          <div style="color: #67e8f9; font-size: 0.75rem; font-weight: 700;
+                       text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">
+            📦 FUTURES
+          </div>
+          <div style="color: #f1f5f9; font-size: 1.2rem; font-weight: 700; margin-bottom: 12px;">
+            {fv_sig}
+          </div>
+          <div style="color: #94a3b8; font-size: 0.85rem; line-height: 1.5;">
+            {"<br>• ".join([""] + fn_notes)}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        st.markdown("---")
+elif section == "📊 Pricing & Volatility":
+    st.markdown('<div class="qe-section">📊 Pricing & Volatility Analysis</div>',
+                  unsafe_allow_html=True)
 
-        if not have_options:
-            if data_mode == "Upload CSV/Excel or enter manually":
-                st.info("Upload a file above, or add at least one valid row in the table (Strike > 0, Type, "
-                       "Expiry, Last Price) to enable pricing.")
-            else:
-                msg = f"No options data available. {exp_note}."
-                if ticker_input.upper().endswith(".BO"):
-                    nse_alt = ticker_input.upper().replace(".BO", ".NS")
-                    msg += f" Try **{nse_alt}** — NSE-listed large caps usually have active F&O data."
-                elif ticker_input.upper().endswith(".NS") and "blocked" in exp_note.lower():
-                    msg += (" This is a known limitation of NSE India's free public API — it actively blocks "
-                            "scripted/automated requests, especially from outside India or from cloud-hosted "
-                            "servers, regardless of the stock. Reliable NSE options data generally requires a "
-                            "paid/authenticated source (e.g. a broker API like Zerodha Kite or Angel One SmartAPI). "
-                            "**Use the Manual Entry option above instead** — enter the option prices you see on "
-                            "your broker's app and Optika will price/hedge/analyze them normally.")
-                st.warning(msg + " Showing price/volatility analysis only.")
+    # Vol metrics
+    st.markdown("### Volatility Estimates")
+    v1, v2, v3, v4, v5, v6 = st.columns(6)
+    v1.metric("Historical", f"{h_vol:.1%}" if not np.isnan(h_vol) else "N/A")
+    v2.metric("EWMA", f"{e_vol:.1%}" if not np.isnan(e_vol) else "N/A")
+    v3.metric("GARCH", f"{g_vol:.1%}" if not np.isnan(g_vol) else "N/A")
+    v4.metric("XGBoost", f"{x_vol:.1%}" if not np.isnan(x_vol) else "N/A")
+    v5.metric("Implied", f"{iv:.1%}" if not np.isnan(iv) else "N/A")
+    v6.metric("Model-Free IV", f"{mfiv:.1%}" if not np.isnan(mfiv) else "N/A")
 
-            with st.spinner("Fitting GARCH(1,1)..."):
-                g_vol = garch_forecast_vol(hist["log_return"])
-            v1, v2, v3 = st.columns(3)
-            v1.metric("Historical Vol (1y)", f"{h_vol:.1%}" if not np.isnan(h_vol) else "N/A")
-            v2.metric("EWMA Vol", f"{e_vol:.1%}" if not np.isnan(e_vol) else "N/A")
-            v3.metric("GARCH Forecast Vol", f"{g_vol:.1%}" if not np.isnan(g_vol) else "N/A")
-            st.line_chart(hist["Close"])
-        else:
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                expiry = st.selectbox("Expiry", expiries, index=min(2, len(expiries) - 1))
+    if pcr_oi is not None:
+        p1, p2 = st.columns(2)
+        p1.metric("Put-Call Ratio (OI)", f"{pcr_oi:.2f}",
+                   "Bearish" if pcr_oi > 1 else "Bullish")
+        if pcr_vol is not None:
+            p2.metric("Put-Call Ratio (Vol)", f"{pcr_vol:.2f}",
+                       "Bearish" if pcr_vol > 1 else "Bullish")
 
-            if data_mode == "Upload CSV/Excel or enter manually":
-                chain = manual_chain_all[manual_chain_all["expiry"] == str(expiry)].copy()
-            else:
-                chain = get_options_chain(ticker_input, expiry, exp_source)
+    # Vol time series
+    rv21 = realized_vol_series(hist["log_return"], 21)
+    rv63 = realized_vol_series(hist["log_return"], 63)
+    lam_e = 0.94
+    var_e = hist["log_return"].dropna().iloc[0]**2
+    evals = []
+    for ret in hist["log_return"].dropna():
+        var_e = lam_e*var_e + (1-lam_e)*ret**2
+        evals.append(np.sqrt(var_e*252))
+    ewma_s = pd.Series(evals, index=hist["log_return"].dropna().index)
 
-            strikes = sorted(chain["strike"].unique()) if not chain.empty else []
-            default_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot)) if strikes else 0
-            with c2:
-                strike = st.selectbox("Strike", strikes, index=default_idx) if strikes else st.number_input("Strike", value=float(spot))
-            with c3:
-                option_type = st.selectbox("Option type", ["call", "put"])
+    fig_v = go.Figure()
+    fig_v.add_trace(go.Scatter(x=rv21.index, y=rv21, name="21d Realized",
+                                 line=dict(color=PALETTE["primary"], width=2)))
+    fig_v.add_trace(go.Scatter(x=rv63.index, y=rv63, name="63d Realized",
+                                 line=dict(color=PALETTE["secondary"], width=2)))
+    fig_v.add_trace(go.Scatter(x=ewma_s.index, y=ewma_s, name="EWMA",
+                                 line=dict(color=PALETTE["warning"], width=1.5, dash="dot")))
+    if not np.isnan(iv):
+        fig_v.add_hline(y=float(iv), line_dash="dash", line_color=PALETTE["danger"],
+                          annotation_text=f"Current IV: {iv:.1%}",
+                          annotation_font=dict(color=PALETTE["danger"]))
+    fig_v.update_yaxes(tickformat=".0%")
+    apply_pro_style(fig_v, "Realized vs Implied Volatility", 420)
+    st.plotly_chart(fig_v, use_container_width=True)
 
-            expiry_str = str(expiry)[:11]
-            tau = max((parse_expiry_date(expiry_str) - datetime.now()).days, 1) / 365
+    st.markdown("### Option Pricing — Multi-Model Comparison")
+    if is_synth:
+        st.info("💡 Market price is BSM-theoretic (synthetic chain).")
 
-            with st.spinner("Fitting GARCH(1,1)..."):
-                g_vol = garch_forecast_vol(hist["log_return"])
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("BSM", f"{ccy}{bsm_p:.4f}")
+    m2.metric("Binomial", f"{ccy}{binom_p:.4f}")
+    m3.metric("Monte Carlo", f"{ccy}{mc_p:.4f}", f"±{mc_err:.4f}")
+    m4.metric("Heston", f"{ccy}{heston_p:.4f}" if not np.isnan(heston_p) else "N/A")
+    m5.metric("Merton", f"{ccy}{merton_p:.4f}" if not np.isnan(merton_p) else "N/A")
+    m6.metric("Market", f"{ccy}{market_price:.4f}" if not np.isnan(market_price) else "N/A")
 
-            row = chain[(chain["strike"] == strike) & (chain["type"] == option_type)]
-            market_price = float(row["lastPrice"].iloc[0]) if not row.empty else np.nan
-            iv = implied_vol(market_price, spot, strike, rate, div_yield, tau, option_type) if not np.isnan(market_price) else np.nan
-            vol_for_pricing = iv if not np.isnan(iv) else h_vol
+    mnames = ["BSM","Binomial","Monte Carlo","Heston","Merton JD","Market"]
+    mprices = [bsm_p, binom_p, mc_p,
+                heston_p if not np.isnan(heston_p) else 0,
+                merton_p if not np.isnan(merton_p) else 0,
+                market_price if not np.isnan(market_price) else 0]
+    colors = [PALETTE["primary"], PALETTE["secondary"], PALETTE["success"],
+               PALETTE["warning"], PALETTE["danger"], PALETTE["muted"]]
 
-            st.markdown("### Volatility Estimates")
-            v1, v2, v3, v4 = st.columns(4)
-            v1.metric("Historical Vol (1y)", f"{h_vol:.1%}" if not np.isnan(h_vol) else "N/A")
-            v2.metric("EWMA Vol", f"{e_vol:.1%}" if not np.isnan(e_vol) else "N/A")
-            v3.metric("GARCH Forecast Vol", f"{g_vol:.1%}" if not np.isnan(g_vol) else "N/A")
-            v4.metric("Implied Vol (this option)", f"{iv:.1%}" if not np.isnan(iv) else "N/A")
+    fig_b = go.Figure()
+    fig_b.add_trace(go.Bar(
+        x=mnames, y=mprices, marker=dict(color=colors, line=dict(color="#0b0f1a", width=1)),
+        text=[f"{ccy}{v:.4f}" for v in mprices], textposition="outside",
+        textfont=dict(size=11, color="#f1f5f9"),
+        hovertemplate="<b>%{x}</b><br>Price: %{text}<extra></extra>",
+    ))
+    if not np.isnan(market_price):
+        fig_b.add_hline(y=float(market_price), line_dash="dash", line_color="#f1f5f9",
+                         annotation_text="Market Mid", annotation_position="right")
+    apply_pro_style(fig_b, "Pricing Model Comparison", 400, show_legend=False)
+    fig_b.update_yaxes(title_text=f"Price ({ccy})")
+    st.plotly_chart(fig_b, use_container_width=True)
 
-            st.markdown("### Option Pricing — 3 Classical Methods")
-            bsm_p = bsm_price(spot, strike, rate, div_yield, vol_for_pricing, tau, option_type)
-            binom_p = binomial_price(spot, strike, rate, div_yield, vol_for_pricing, tau, option_type, "american", 300)
-            mc_p, mc_err = monte_carlo_price(spot, strike, rate, div_yield, vol_for_pricing, tau, option_type)
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("Black-Scholes-Merton", f"{ccy}{bsm_p:.2f}")
-            p2.metric("Binomial Tree (American)", f"{ccy}{binom_p:.2f}")
-            p3.metric("Monte Carlo", f"{ccy}{mc_p:.2f}", f"±{mc_err:.3f} SE")
-            p4.metric("Market Price", f"{ccy}{market_price:.2f}" if not np.isnan(market_price) else "N/A")
+    # IV Smile
+    if not chain.empty:
+        st.markdown("### Implied Volatility Smile")
+        smile = []
+        for _, rr in chain[chain["type"]==option_type].iterrows():
+            mp2 = rr.get(pc_col, np.nan)
+            if pd.isna(mp2) or mp2 <= 0: continue
+            k2 = float(rr["strike"])
+            iv2 = implied_vol(mp2, spot, k2, rate, div_yield, tau, option_type)
+            if not np.isnan(iv2) and 0.01 < iv2 < 3:
+                smile.append({"strike":k2, "iv":iv2, "moneyness":k2/spot,
+                                "oi":float(rr.get("openInterest",0) or 0)})
+        if smile:
+            sdf = pd.DataFrame(smile).sort_values("strike")
+            fig_sm = make_subplots(specs=[[{"secondary_y":True}]])
+            fig_sm.add_trace(go.Scatter(
+                x=sdf["moneyness"], y=sdf["iv"], mode="lines+markers", name="IV",
+                line=dict(color=PALETTE["primary"], width=2.5),
+                marker=dict(size=8, color=PALETTE["primary"],
+                             line=dict(color="#0b0f1a", width=1))
+            ), secondary_y=False)
+            fig_sm.add_trace(go.Bar(
+                x=sdf["moneyness"], y=sdf["oi"], name="Open Interest",
+                marker=dict(color=PALETTE["secondary"], opacity=0.3)
+            ), secondary_y=True)
+            fig_sm.add_vline(x=1.0, line_dash="dash", line_color=PALETTE["accent"],
+                              annotation_text="ATM")
+            fig_sm.update_yaxes(title_text="Implied Vol", tickformat=".0%", secondary_y=False)
+            fig_sm.update_yaxes(title_text="Open Interest", secondary_y=True)
+            fig_sm.update_xaxes(title_text="Moneyness (K/S)")
+            apply_pro_style(fig_sm, "IV Smile with Open Interest Overlay", 420)
+            st.plotly_chart(fig_sm, use_container_width=True)
 
-            st.markdown("### Greeks — First & Second Order")
-            greeks1 = bsm_greeks(spot, strike, rate, div_yield, vol_for_pricing, tau, option_type)
-            greeks2 = bsm_greeks_second_order(spot, strike, rate, div_yield, vol_for_pricing, tau, option_type)
-            gc1, gc2, gc3, gc4, gc5 = st.columns(5)
-            gc1.metric("Delta", f"{greeks1['delta']:.3f}")
-            gc2.metric("Gamma", f"{greeks1['gamma']:.4f}")
-            gc3.metric("Vega (per 1% vol)", f"{greeks1['vega']:.3f}")
-            gc4.metric("Theta (per day)", f"{greeks1['theta']:.3f}")
-            gc5.metric("Rho (per 1% rate)", f"{greeks1['rho']:.3f}")
-            gc6, gc7, gc8 = st.columns(3)
-            gc6.metric("Vanna", f"{greeks2['vanna']:.4f}", help="d(Delta)/d(Vol) — how delta shifts as volatility moves")
-            gc7.metric("Volga", f"{greeks2['volga']:.4f}", help="d(Vega)/d(Vol) — how vega shifts as volatility moves")
-            gc8.metric("Charm", f"{greeks2['charm']:.4f}", help="d(Delta)/d(Time) — how delta decays as time passes")
+elif section == "🏛️ Greeks":
+    st.markdown('<div class="qe-section">🏛️ Risk Sensitivities (Greeks)</div>',
+                  unsafe_allow_html=True)
 
-            with st.expander("Show price history"):
-                st.line_chart(hist["Close"])
+    g1, g2, g3, g4, g5 = st.columns(5)
+    g1.metric("Δ Delta", f"{greeks['delta']:.4f}")
+    g2.metric("Γ Gamma", f"{greeks['gamma']:.6f}")
+    g3.metric("ν Vega", f"{greeks['vega']:.4f}")
+    g4.metric("Θ Theta/d", f"{greeks['theta']:.4f}")
+    g5.metric("ρ Rho", f"{greeks['rho']:.4f}")
 
-    # ---------------- TAB 2: Vol Surface & Forecasting ----------------
-    with tabs[1]:
-        st.markdown("### Machine-Learning Volatility Forecast")
-        if HAS_SKLEARN:
-            ml_vol, ml_r2 = ml_vol_forecast(hist["log_return"])
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Random Forest Forecast Vol", f"{ml_vol:.1%}" if not np.isnan(ml_vol) else "N/A")
-            mc2.metric("GARCH Forecast Vol", f"{g_vol:.1%}" if not np.isnan(g_vol) else "N/A")
-            mc3.metric("ML Out-of-Sample R²", f"{ml_r2:.2f}" if not np.isnan(ml_r2) else "N/A")
-            st.caption("R² compares the Random Forest's held-out prediction accuracy for 20-day-forward "
-                       "realized volatility — closer to 1.0 means a better forecast; near 0 or negative "
-                       "means it's barely beating a flat-average guess.")
-        else:
-            st.info("Install `scikit-learn` (`pip install scikit-learn`) to enable the ML volatility forecaster.")
+    st.markdown("### Second-Order Greeks")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Vanna", f"{greeks['vanna']:.4f}")
+    s2.metric("Volga", f"{greeks['volga']:.4f}")
+    s3.metric("Charm", f"{greeks['charm']:.4f}")
 
-        if have_options:
-            st.markdown("### Model-Free Implied Volatility (VIX-style)")
-            mf_iv = model_free_implied_vol(chain, spot, rate, tau)
-            mf1, mf2 = st.columns(2)
-            mf1.metric("Model-Free IV (this expiry)", f"{mf_iv:.1%}" if not np.isnan(mf_iv) else "N/A")
-            mf2.metric("Single-Strike ATM Implied Vol", f"{iv:.1%}" if not np.isnan(iv) else "N/A")
-            st.caption("Model-free IV uses a variance-weighted average across ALL out-of-the-money strikes "
-                       "(the CBOE VIX methodology) rather than one strike's noisy quote — generally more robust.")
+    # Greeks vs Spot
+    sr_range = np.linspace(spot*0.7, spot*1.3, 100)
+    deltas = [bsm_greeks(s2, strike, rate, div_yield, vol_fp, tau, option_type)["delta"] for s2 in sr_range]
+    gammas = [bsm_greeks(s2, strike, rate, div_yield, vol_fp, tau, option_type)["gamma"] for s2 in sr_range]
+    vannas = [bsm_greeks(s2, strike, rate, div_yield, vol_fp, tau, option_type)["vanna"] for s2 in sr_range]
+    charms = [bsm_greeks(s2, strike, rate, div_yield, vol_fp, tau, option_type)["charm"] for s2 in sr_range]
 
-            st.markdown("### Full Implied Volatility Surface (Strike × Maturity)")
-            if st.button("Build 3D Volatility Surface (may take a moment for auto-fetched data)"):
-                with st.spinner("Building surface across expiries..."):
-                    if data_mode == "Upload CSV/Excel or enter manually":
-                        surf_rows = []
-                        for _, r in manual_chain_all.iterrows():
-                            mp = r.get("lastPrice", np.nan)
-                            if pd.isna(mp) or mp <= 0:
-                                continue
-                            r_tau = max((parse_expiry_date(str(r["expiry"])[:11]) - datetime.now()).days, 1) / 365
-                            r_iv = implied_vol(mp, spot, r["strike"], rate, div_yield, r_tau, r["type"])
-                            if not np.isnan(r_iv) and 0.01 < r_iv < 3:
-                                surf_rows.append({"expiry": r["expiry"], "tau": r_tau, "strike": r["strike"], "iv": r_iv})
-                        surface_df = pd.DataFrame(surf_rows)
-                    else:
-                        surface_df = build_vol_surface(ticker_input, expiries, spot, rate, div_yield, exp_source, option_type)
-                if not surface_df.empty and len(surface_df["tau"].unique()) > 1:
-                    fig_surf = go.Figure(data=[go.Mesh3d(
-                        x=surface_df["strike"], y=surface_df["tau"] * 365, z=surface_df["iv"],
-                        intensity=surface_df["iv"], colorscale="Viridis", opacity=0.85,
-                    )])
-                    fig_surf.update_layout(
-                        scene=dict(xaxis_title="Strike", yaxis_title="Days to Expiry", zaxis_title="Implied Vol"),
-                        height=550, margin=dict(l=0, r=0, t=30, b=0),
-                    )
-                    st.plotly_chart(fig_surf, use_container_width=True)
-                elif not surface_df.empty:
-                    st.info("Only one expiry has valid quotes — add rows for a second expiry to render a "
-                            "true 3D surface (strike × maturity). Showing the smile below instead.")
-                else:
-                    st.info("Not enough valid quotes across expiries to build a surface for this ticker.")
+    fig_gk = make_subplots(rows=2, cols=2,
+                            subplot_titles=("Delta", "Gamma", "Vanna", "Charm"),
+                            vertical_spacing=0.14, horizontal_spacing=0.10)
+    for arr, r_, c_, col in [(deltas,1,1,PALETTE["primary"]),
+                                (gammas,1,2,PALETTE["secondary"]),
+                                (vannas,2,1,PALETTE["warning"]),
+                                (charms,2,2,PALETTE["success"])]:
+        fig_gk.add_trace(go.Scatter(x=sr_range, y=arr, line=dict(color=col, width=2.5),
+                                     fill="tozeroy", fillcolor=col.replace(")",",0.1)").replace("rgb","rgba"),
+                                     showlegend=False), row=r_, col=c_)
+        fig_gk.add_vline(x=float(spot), line_dash="dash", line_color="#f1f5f9",
+                          opacity=0.5, row=r_, col=c_)
+    apply_pro_style(fig_gk, "Greeks vs Spot Price", 550, show_legend=False)
+    st.plotly_chart(fig_gk, use_container_width=True)
 
-            st.markdown("### Implied Volatility Smile (selected expiry)")
-            smile_rows = []
-            for _, r in chain[chain["type"] == option_type].iterrows():
-                mp = r.get("lastPrice", np.nan)
-                if pd.isna(mp) or mp <= 0:
-                    continue
-                iv_k = implied_vol(mp, spot, r["strike"], rate, div_yield, tau, option_type)
-                if not np.isnan(iv_k) and 0.01 < iv_k < 3:
-                    smile_rows.append({"strike": r["strike"], "iv": iv_k})
-            if smile_rows:
-                smile_df = pd.DataFrame(smile_rows).sort_values("strike")
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=smile_df["strike"], y=smile_df["iv"], mode="lines+markers"))
-                fig.add_vline(x=spot, line_dash="dash", annotation_text="Spot")
-                fig.update_layout(xaxis_title="Strike", yaxis_title="Implied Vol", height=350)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Not enough live quotes to build a smile for this expiry.")
-        else:
-            st.info("No options chain available for this ticker — vol surface and smile need live options data.")
+elif section == "🌐 Volatility Surface":
+    st.markdown('<div class="qe-section">🌐 Volatility Surface</div>', unsafe_allow_html=True)
 
-    # ---------------- TAB 3: Advanced Models (Heston / Jump-Diffusion) ----------------
-    with tabs[2]:
-        if have_options:
-            st.markdown("### Stochastic-Volatility & Jump-Diffusion Pricing")
-            st.caption("BSM assumes constant volatility and continuous price paths — both are false in "
-                       "real markets. These models relax those assumptions and are what actually generate "
-                       "the volatility smile you see in Tab 2.")
+    sel_exp = exps_all[:min(surf_exp, len(exps_all))]
+    with st.spinner("Building surface..."):
+        surf_df = build_vol_surface(
+            {e:chains_all[e] for e in sel_exp if e in chains_all},
+            spot, rate, div_yield, option_type)
 
-            hc1, hc2, hc3 = st.columns(3)
-            with hc1:
-                heston_rho = st.slider("Heston: spot-vol correlation (ρ)", -0.9, 0.0, -0.6, 0.1,
-                                        help="Negative for equities: vol tends to rise when price falls (leverage effect)")
-            with hc2:
-                heston_kappa = st.slider("Heston: mean-reversion speed (κ)", 0.5, 5.0, 2.0, 0.5)
-            with hc3:
-                heston_vol_of_vol = st.slider("Heston: vol-of-vol (σᵥ)", 0.1, 0.8, 0.3, 0.05)
+    if surf_df.empty:
+        st.warning("Not enough data to build vol surface.")
+    else:
+        pivot = surf_df.pivot_table(values="iv", index="expiry",
+                                     columns="strike", aggfunc="mean").sort_index()
+        col_vals = np.array([float(c) for c in pivot.columns])
+        closest = float(col_vals[np.argmin(np.abs(col_vals-strike))])
 
-            with st.spinner("Running Heston & Merton jump-diffusion Monte Carlo..."):
-                heston_p, heston_err = heston_mc_price(
-                    spot, strike, rate, div_yield, tau, option_type,
-                    v0=vol_for_pricing ** 2, kappa=heston_kappa,
-                    theta=vol_for_pricing ** 2, sigma_v=heston_vol_of_vol, rho=heston_rho,
-                )
-                jump_p, jump_err = merton_jump_price(
-                    spot, strike, rate, div_yield, vol_for_pricing, tau, option_type,
-                )
+        fig_sf = go.Figure(go.Heatmap(
+            z=pivot.values,
+            x=[float(k) for k in pivot.columns],
+            y=pivot.index.tolist(),
+            colorscale=[[0, "#1e1b4b"],[0.25,"#312e81"],[0.5,"#6366f1"],
+                         [0.75,"#22d3ee"],[1,"#10b981"]],
+            colorbar=dict(title="IV", tickformat=".0%", thickness=15, len=0.75),
+            hovertemplate="Strike: %{x}<br>Expiry: %{y}<br>IV: %{z:.2%}<extra></extra>",
+        ))
+        fig_sf.add_vline(x=closest, line_dash="dash", line_color="#f1f5f9",
+                          annotation_text=f"K={strike:.0f}",
+                          annotation_font=dict(color="#f1f5f9"))
+        fig_sf.update_xaxes(title="Strike")
+        fig_sf.update_yaxes(title="Expiry")
+        apply_pro_style(fig_sf, "Implied Volatility Surface", 480, show_legend=False)
+        st.plotly_chart(fig_sf, use_container_width=True)
 
-            bsm_p_adv = bsm_price(spot, strike, rate, div_yield, vol_for_pricing, tau, option_type)
-            a1, a2, a3 = st.columns(3)
-            a1.metric("BSM (flat vol)", f"{ccy}{bsm_p_adv:.2f}")
-            a2.metric("Heston (stochastic vol)", f"{ccy}{heston_p:.2f}", f"±{heston_err:.3f} SE")
-            a3.metric("Merton (jump-diffusion)", f"{ccy}{jump_p:.2f}", f"±{jump_err:.3f} SE")
+        # Term structure
+        st.markdown("### ATM Volatility Term Structure")
+        term_rows = []
+        for e2 in sel_exp:
+            try:
+                t2 = max((datetime.strptime(e2,"%Y-%m-%d")-datetime.now()).days,1)/365
+            except Exception:
+                continue
+            c2 = chains_all.get(e2, pd.DataFrame())
+            if c2.empty: continue
+            sub = c2[c2["type"]==option_type]
+            if sub.empty: continue
+            atm_k = float(sub.iloc[(sub["strike"]-spot).abs().argsort()[:1]]["strike"].values[0])
+            arow = sub[sub["strike"]==atm_k]
+            if arow.empty: continue
+            mp2 = arow[pc_col if pc_col in arow.columns else "lastPrice"].iloc[0]
+            iv2 = implied_vol(mp2, spot, atm_k, rate, div_yield, t2, option_type)
+            if not np.isnan(iv2) and 0.01 < iv2 < 3:
+                term_rows.append({"days": float(t2*365), "atm_iv": iv2, "expiry": e2})
+        if term_rows:
+            tdf = pd.DataFrame(term_rows).sort_values("days")
+            fig_ts = go.Figure()
+            fig_ts.add_trace(go.Scatter(
+                x=tdf["days"], y=tdf["atm_iv"], mode="lines+markers",
+                line=dict(color=PALETTE["primary"], width=3),
+                marker=dict(size=12, color=PALETTE["primary"],
+                             line=dict(color="#0b0f1a", width=2)),
+                fill="tozeroy", fillcolor="rgba(99,102,241,0.1)",
+                hovertemplate="Days: %{x:.0f}<br>ATM IV: %{y:.2%}<extra></extra>",
+            ))
+            if not np.isnan(h_vol):
+                fig_ts.add_hline(y=float(h_vol), line_dash="dash",
+                                  line_color=PALETTE["warning"],
+                                  annotation_text=f"Hist Vol {h_vol:.1%}")
+            fig_ts.update_yaxes(title="ATM Implied Vol", tickformat=".0%")
+            fig_ts.update_xaxes(title="Days to Expiry")
+            apply_pro_style(fig_ts, "ATM IV Term Structure", 380, show_legend=False)
+            st.plotly_chart(fig_ts, use_container_width=True)
 
-            diff_heston = (heston_p - bsm_p_adv) / bsm_p_adv * 100 if bsm_p_adv > 0 else 0
-            diff_jump = (jump_p - bsm_p_adv) / bsm_p_adv * 100 if bsm_p_adv > 0 else 0
-            st.markdown(f"- Heston prices this option **{diff_heston:+.1f}%** vs BSM — the gap reflects "
-                        f"the extra premium/discount from allowing volatility itself to be random and "
-                        f"correlated with the spot move.")
-            st.markdown(f"- Merton jump-diffusion prices it **{diff_jump:+.1f}%** vs BSM — the gap reflects "
-                        f"crash/jump risk that continuous GBM paths cannot capture.")
-            st.caption("If market price sits closer to Heston/Merton than to flat-vol BSM, that's evidence "
-                       "the market is pricing in stochastic vol or jump risk — exactly why the smile exists.")
-        else:
-            st.info("No options chain available for this ticker — advanced model comparison needs a priced option.")
+elif section == "🔮 Forecasting":
+    st.markdown('<div class="qe-section">🔮 Volatility Forecasting Models</div>',
+                  unsafe_allow_html=True)
 
-    # ---------------- TAB 4: Strategy Builder ----------------
-    with tabs[3]:
-        if have_options:
-            st.markdown("### Multi-Leg Strategy Payoff Builder")
-            preset = st.selectbox("Choose a strategy", list(PRESET_STRATEGIES.keys()))
-            legs = build_legs_from_preset(preset, spot, rate, div_yield, vol_for_pricing, tau)
+    # Model comparison
+    forecasts = {
+        "Historical (252d)": h_vol,
+        "EWMA (λ=0.94)": e_vol,
+        "GARCH(1,1)": g_vol,
+        "XGBoost ML": x_vol,
+        "Model-Free IV": mfiv,
+        "Market IV": iv,
+    }
+    fc_valid = {k:v for k,v in forecasts.items() if v is not None and not np.isnan(v)}
 
-            leg_df = pd.DataFrame(legs)
-            leg_df["premium"] = leg_df["premium"].round(2)
-            st.dataframe(leg_df, use_container_width=True)
+    if fc_valid:
+        st.markdown("### Model Forecast Comparison")
+        fig_fc = go.Figure(go.Bar(
+            x=list(fc_valid.keys()), y=list(fc_valid.values()),
+            marker=dict(color=[PALETTE["primary"], PALETTE["secondary"],
+                                 PALETTE["success"], PALETTE["warning"],
+                                 PALETTE["accent"], PALETTE["danger"]][:len(fc_valid)],
+                         line=dict(color="#0b0f1a", width=1)),
+            text=[f"{v:.1%}" for v in fc_valid.values()], textposition="outside",
+        ))
+        fig_fc.update_yaxes(tickformat=".0%", title="Annualised Vol")
+        apply_pro_style(fig_fc, "Volatility Forecast — Cross-Model Comparison", 380, show_legend=False)
+        st.plotly_chart(fig_fc, use_container_width=True)
 
-            spot_range = np.linspace(spot * 0.7, spot * 1.3, 200)
-            payoff = payoff_at_expiry(legs, spot_range)
-            fig_pay = go.Figure()
-            fig_pay.add_trace(go.Scatter(x=spot_range, y=payoff, mode="lines", name="P&L at expiry",
-                                          line=dict(width=3)))
-            fig_pay.add_hline(y=0, line_dash="dot", line_color="gray")
-            fig_pay.add_vline(x=spot, line_dash="dash", annotation_text="Current Spot")
-            fig_pay.update_layout(xaxis_title=f"Underlying Price at Expiry ({ccy})",
-                                   yaxis_title=f"P&L ({ccy})", height=400)
-            st.plotly_chart(fig_pay, use_container_width=True)
+    # GARCH conditional vol
+    if HAS_ARCH and len(hist["log_return"].dropna()) > 100:
+        st.markdown("### GARCH(1,1) Conditional Volatility Time Series")
+        try:
+            rs = hist["log_return"].dropna()*100
+            gf = arch_model(rs, vol="Garch", p=1, q=1).fit(disp="off")
+            cv = gf.conditional_volatility/100*np.sqrt(252)
+            fig_g = go.Figure()
+            fig_g.add_trace(go.Scatter(
+                x=cv.index, y=cv, name="GARCH Cond. Vol",
+                line=dict(color=PALETTE["success"], width=2),
+                fill="tozeroy", fillcolor="rgba(16,185,129,0.1)",
+            ))
+            fig_g.update_yaxes(tickformat=".0%")
+            apply_pro_style(fig_g, "GARCH(1,1) Historical Conditional Volatility", 380, show_legend=False)
+            st.plotly_chart(fig_g, use_container_width=True)
+            st.caption(f"**Model parameters:** ω={gf.params.get('omega',0):.2e}, "
+                        f"α={gf.params.get('alpha[1]',0):.4f}, "
+                        f"β={gf.params.get('beta[1]',0):.4f}, "
+                        f"Persistence (α+β)={gf.params.get('alpha[1]',0)+gf.params.get('beta[1]',0):.4f}")
+        except Exception as e:
+            st.info(f"GARCH chart unavailable: {e}")
 
-            max_profit = payoff.max()
-            max_loss = payoff.min()
-            breakevens = spot_range[np.where(np.diff(np.sign(payoff)))[0]]
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Max Profit (in range shown)", f"{ccy}{max_profit:.2f}")
-            mc2.metric("Max Loss (in range shown)", f"{ccy}{max_loss:.2f}")
-            mc3.metric("Breakeven(s)", ", ".join(f"{ccy}{b:.2f}" for b in breakevens) if len(breakevens) else "N/A")
+    # Return distribution
+    st.markdown("### Return Distribution Analysis")
+    ret_c = hist["log_return"].dropna()
+    fig_r = go.Figure()
+    fig_r.add_trace(go.Histogram(
+        x=ret_c, nbinsx=80, histnorm="probability density",
+        marker=dict(color=PALETTE["primary"], opacity=0.6,
+                     line=dict(color="#0b0f1a", width=0.5)),
+        name="Observed"
+    ))
+    xr = np.linspace(ret_c.min(), ret_c.max(), 200)
+    fig_r.add_trace(go.Scatter(
+        x=xr, y=norm.pdf(xr, ret_c.mean(), ret_c.std()),
+        name="Normal Fit", line=dict(color=PALETTE["warning"], width=2.5),
+    ))
+    fig_r.update_xaxes(title="Log Return")
+    fig_r.update_yaxes(title="Density")
+    apply_pro_style(fig_r, "Return Distribution vs Normal", 380)
+    st.plotly_chart(fig_r, use_container_width=True)
 
-            st.markdown("### Portfolio Greeks (aggregated across all legs)")
-            pg = portfolio_greeks(legs, spot, rate, div_yield, vol_for_pricing, tau)
-            pgc = st.columns(5)
-            for i, k in enumerate(["delta", "gamma", "vega", "theta", "rho"]):
-                pgc[i].metric(k.capitalize(), f"{pg[k]:.3f}")
-            pgc2 = st.columns(3)
-            for i, k in enumerate(["vanna", "volga", "charm"]):
-                pgc2[i].metric(k.capitalize(), f"{pg[k]:.4f}")
+    # Skew/kurtosis
+    skew = ret_c.skew(); kurt = ret_c.kurtosis()
+    sk1, sk2, sk3 = st.columns(3)
+    sk1.metric("Skewness", f"{skew:.4f}", "Negative tail" if skew < -0.1 else "Positive tail" if skew > 0.1 else "Symmetric")
+    sk2.metric("Excess Kurtosis", f"{kurt:.4f}", "Heavy tails" if kurt > 1 else "Normal-ish")
+    sk3.metric("Sample Size", f"{len(ret_c):,} days")
 
-            st.session_state["current_legs"] = legs
-        else:
-            st.info("No options chain available for this ticker — strategy builder needs live options data.")
+elif section == "🎨 Strategies":
+    st.markdown('<div class="qe-section">🎨 Multi-Leg Strategy Builder</div>', unsafe_allow_html=True)
 
-    # ---------------- TAB 5: Risk & Hedging ----------------
-    with tabs[4]:
-        if have_options:
-            st.markdown("### Dynamic Delta-Hedge Simulation (simulated forward path)")
-            h1, h2 = st.columns(2)
-            with h1:
-                rehedge_every = st.slider("Rehedge every N steps", 1, 10, 1)
-            with h2:
-                cost_bps = st.slider("Transaction cost (bps per trade)", 0, 50, 5)
+    sc1, sc2, sc3 = st.columns([2,1,1])
+    with sc1:
+        sname = st.selectbox("Strategy", list(STRATEGIES.keys()))
+    with sc2:
+        svol = st.slider("Vol (%)", 5, 150, int(vol_fp*100)) / 100
+    with sc3:
+        stau = st.slider("Days", 7, 365, max(7, int(tau*365)))
 
-            sim_path = simulate_gbm_path(spot, rate, div_yield, vol_for_pricing, tau, n_steps=60, seed=7)
-            hedge_log, final_pnl = simulate_delta_hedge(sim_path, strike, rate, div_yield, vol_for_pricing,
-                                                         tau, option_type, rehedge_every, cost_bps)
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(y=hedge_log["spot"], name="Simulated Spot Path"))
-            fig2.update_layout(height=280, yaxis_title="Price", xaxis_title="Step")
-            st.plotly_chart(fig2, use_container_width=True)
-            st.metric("Simulated Hedge P&L (selling this option & delta-hedging)", f"{ccy}{final_pnl:.2f}")
-            hedge_pnl = final_pnl
+    sr2, pnl2, nprem, linfo, bes, maxp, maxl = strategy_payoff(
+        sname, spot, rate, div_yield, svol, stau/365)
 
-            st.markdown("### Value at Risk / Conditional VaR")
-            legs_for_risk = st.session_state.get("current_legs", [
-                {"type": option_type, "strike": strike, "position": -1,
-                 "premium": bsm_price(spot, strike, rate, div_yield, vol_for_pricing, tau, option_type)}
-            ])
-            pg_risk = portfolio_greeks(legs_for_risk, spot, rate, div_yield, vol_for_pricing, tau)
-            delta_dollar = pg_risk["delta"] * spot
+    ldf = pd.DataFrame(linfo)
+    st.dataframe(ldf, use_container_width=True, hide_index=True)
 
-            confidence = st.select_slider("Confidence level", options=[0.90, 0.95, 0.99], value=0.95)
-            var_p, cvar_p = var_cvar_parametric(delta_dollar, vol_for_pricing, confidence)
-            var_h, cvar_h = var_cvar_historical(hist["log_return"], delta_dollar, confidence)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Net Premium", f"{ccy}{nprem:.4f}", "Received" if nprem > 0 else "Paid")
+    m2.metric("Breakevens", ", ".join([f"{ccy}{b:.2f}" for b in bes]) or "None")
+    m3.metric("Max Profit", f"{ccy}{maxp:.2f}" if maxp < 1e5 else "Unlimited")
+    m4.metric("Max Loss", f"{ccy}{abs(maxl):.2f}" if maxl > -1e5 else "Unlimited")
 
-            vc1, vc2 = st.columns(2)
-            with vc1:
-                st.markdown("**Parametric (delta-normal)**")
-                st.metric(f"1-day VaR ({confidence:.0%})", f"{ccy}{var_p:,.2f}")
-                st.metric(f"1-day CVaR ({confidence:.0%})", f"{ccy}{cvar_p:,.2f}")
-            with vc2:
-                st.markdown("**Historical simulation**")
-                st.metric(f"1-day VaR ({confidence:.0%})", f"{ccy}{var_h:,.2f}" if not np.isnan(var_h) else "N/A")
-                st.metric(f"1-day CVaR ({confidence:.0%})", f"{ccy}{cvar_h:,.2f}" if not np.isnan(cvar_h) else "N/A")
-            st.caption("VaR/CVaR here approximate the CURRENT strategy from the Strategy Builder tab (uses "
-                       "its net delta exposure). Build a strategy in Tab 4 first for a multi-leg risk read.")
+    fig_p = go.Figure()
+    fig_p.add_trace(go.Scatter(x=sr2, y=np.maximum(pnl2, 0), fill="tozeroy",
+                                 fillcolor=f"rgba(16,185,129,0.2)",
+                                 line=dict(width=0), name="Profit zone", showlegend=False))
+    fig_p.add_trace(go.Scatter(x=sr2, y=np.minimum(pnl2, 0), fill="tozeroy",
+                                 fillcolor=f"rgba(239,68,68,0.2)",
+                                 line=dict(width=0), name="Loss zone", showlegend=False))
+    fig_p.add_trace(go.Scatter(x=sr2, y=pnl2, mode="lines", name="P&L",
+                                 line=dict(color=PALETTE["primary"], width=3)))
+    fig_p.add_hline(y=0.0, line_color="#f1f5f9", line_dash="dash", opacity=0.5)
+    fig_p.add_vline(x=float(spot), line_color=PALETTE["warning"], line_dash="dot",
+                     annotation_text="Spot")
+    for be in bes:
+        fig_p.add_vline(x=float(be), line_color=PALETTE["success"], line_dash="dash",
+                         annotation_text=f"BE {ccy}{be:.1f}")
+    fig_p.update_xaxes(title=f"Spot at Expiry ({ccy})")
+    fig_p.update_yaxes(title=f"P&L ({ccy})")
+    apply_pro_style(fig_p, f"{sname} — Payoff at Expiry", 480)
+    st.plotly_chart(fig_p, use_container_width=True)
 
-            st.markdown("### Scenario Stress Test")
-            stress_df = stress_test(legs_for_risk, spot, rate, div_yield, vol_for_pricing, tau)
-            st.dataframe(stress_df.style.format({"portfolio_value": f"{ccy}{{:.2f}}", "pnl_vs_base": f"{ccy}{{:+.2f}}"}),
-                         use_container_width=True)
-        else:
-            st.info("No options chain available for this ticker — hedging/risk tools need live options data.")
+elif section == "🛡️ Hedging":
+    st.markdown('<div class="qe-section">🛡️ Delta-Hedge Simulation</div>', unsafe_allow_html=True)
 
-    # ---------------- TAB 6: Backtest & Track Record ----------------
-    with tabs[5]:
-        st.markdown("### Historical Volatility Signal Backtest (walk-forward)")
-        st.caption("Free historical options-chain data isn't available, so this backtests a "
-                   "variance-swap-style proxy directly on price history: forecast near-term vol, "
-                   "compare it to what actually realized afterward, and simulate selling/buying vol "
-                   "accordingly. The signal threshold is calibrated on the first half of history only "
-                   "and tested out-of-sample on the second half (walk-forward), to avoid overfitting.")
+    path = simulate_gbm_path(spot, rate, div_yield, vol_fp, tau, 60, seed=7)
+    hlog, fpnl = simulate_delta_hedge(path, strike, rate, div_yield, vol_fp,
+                                        tau, option_type, rehedge_n, hedge_cost)
+    hc1, hc2, hc3 = st.columns(3)
+    hc1.metric("Hedge P&L", f"{ccy}{fpnl:.4f}", "Profit" if fpnl > 0 else "Loss")
+    hc2.metric("Premium Received", f"{ccy}{bsm_p:.4f}")
+    hc3.metric("Rehedge Every", f"{rehedge_n} step(s)")
 
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            z_thresh = st.slider("Signal z-score threshold", 0.25, 2.0, 0.75, 0.25)
-        with bc2:
-            train_frac = st.slider("Train fraction (walk-forward split)", 0.3, 0.7, 0.5, 0.1)
+    fig_h = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                            subplot_titles=("Simulated Spot Path", "Delta Over Time"),
+                            vertical_spacing=0.10)
+    fig_h.add_trace(go.Scatter(y=hlog["spot"], line=dict(color=PALETTE["primary"], width=2),
+                                 fill="tozeroy", fillcolor="rgba(99,102,241,0.1)",
+                                 showlegend=False), row=1, col=1)
+    fig_h.add_hline(y=float(strike), line_dash="dash", line_color=PALETTE["warning"],
+                     annotation_text="Strike", row=1, col=1)
+    fig_h.add_trace(go.Scatter(y=hlog["delta"], line=dict(color=PALETTE["success"], width=2),
+                                 fill="tozeroy", fillcolor="rgba(16,185,129,0.1)",
+                                 showlegend=False), row=2, col=1)
+    apply_pro_style(fig_h, "Delta-Hedge Path Simulation", 480, show_legend=False)
+    st.plotly_chart(fig_h, use_container_width=True)
 
-        bt_df, bt_stats = historical_vol_signal_backtest(hist, z_threshold=z_thresh, train_frac=train_frac)
-        if not bt_df.empty:
-            fig_bt = go.Figure()
-            fig_bt.add_trace(go.Scatter(y=bt_df["pnl"].cumsum(), name="Cumulative P&L (proxy units)"))
-            fig_bt.update_layout(height=300, xaxis_title="Out-of-sample period", yaxis_title="Cumulative P&L")
-            st.plotly_chart(fig_bt, use_container_width=True)
+    # Multi-path distribution
+    st.markdown("### 100-Path Hedge P&L Distribution")
+    pnls = []
+    for s_ in range(100):
+        p_ = simulate_gbm_path(spot, rate, div_yield, vol_fp, tau, 60, seed=s_)
+        _, pn = simulate_delta_hedge(p_, strike, rate, div_yield, vol_fp,
+                                       tau, option_type, rehedge_n, hedge_cost)
+        pnls.append(pn)
+    parr = np.array(pnls)
+    fig_pd = go.Figure()
+    fig_pd.add_trace(go.Histogram(x=parr, nbinsx=30,
+                                    marker=dict(color=PALETTE["primary"], opacity=0.7,
+                                                 line=dict(color="#0b0f1a", width=1))))
+    fig_pd.add_vline(x=0.0, line_dash="dash", line_color="#f1f5f9")
+    fig_pd.add_vline(x=float(parr.mean()), line_color=PALETTE["warning"], line_dash="dot",
+                      annotation_text=f"Mean {ccy}{parr.mean():.2f}")
+    fig_pd.update_xaxes(title=f"P&L ({ccy})")
+    fig_pd.update_yaxes(title="Frequency")
+    apply_pro_style(fig_pd, "Hedge P&L Distribution (100 GBM paths)", 380, show_legend=False)
+    st.plotly_chart(fig_pd, use_container_width=True)
 
-            st.markdown("**Performance Stats (out-of-sample)**")
-            stat_cols = st.columns(len(bt_stats))
-            for i, (k, v) in enumerate(bt_stats.items()):
-                if isinstance(v, float):
-                    stat_cols[i].metric(k, f"{v:.3f}" if abs(v) < 10 else f"{v:.1f}")
-                else:
-                    stat_cols[i].metric(k, str(v))
-            st.caption("These stats are on a volatility-trading PROXY (not real option P&L), and Sharpe/"
-                       "Sortino/Calmar are computed on proxy units, not $ returns — treat as directional "
-                       "evidence of whether the signal has edge, not as a literal expected return.")
-        else:
-            st.info("Not enough historical data to run a meaningful backtest for this ticker.")
+    dc1, dc2, dc3, dc4 = st.columns(4)
+    dc1.metric("Mean", f"{ccy}{parr.mean():.4f}")
+    dc2.metric("Std Dev", f"{ccy}{parr.std():.4f}")
+    dc3.metric("Best", f"{ccy}{parr.max():.4f}")
+    dc4.metric("Worst", f"{ccy}{parr.min():.4f}")
 
-        st.markdown("---")
-        st.markdown("### 📜 Recommendation Track Record")
-        st.caption("Every verdict this engine generates gets logged here (locally, on your machine) so you "
-                   "can look back and see how the calls would have played out.")
-        history_df = get_recommendation_history()
-        if not history_df.empty:
-            st.dataframe(history_df, use_container_width=True)
-        else:
-            st.info("No recommendations logged yet — they're saved automatically each time you view the "
-                   "Final Recommendation tab.")
+elif section == "📦 Futures":
+    st.markdown('<div class="qe-section">📦 Futures & Forward Analysis</div>', unsafe_allow_html=True)
 
-    # ---------------- TAB 7: Final Recommendation ----------------
-    with tabs[6]:
-        st.markdown("## 🎯 Rule-Based Signals")
-        fwd = theoretical_forward_price(spot, rate, div_yield, tau if tau else 30 / 365)
-        f1, f2 = st.columns(2)
-        f1.metric("Theoretical Forward/Futures Fair Value", f"{ccy}{fwd:.2f}")
-        market_futures = f2.number_input("Market futures price (optional, if you have a quote)", value=0.0)
+    fc1, fc2, fc3 = st.columns(3)
+    fc1.metric("Spot", f"{ccy}{spot:,.2f}")
+    fc2.metric("Fair Forward", f"{ccy}{fwd:.2f}")
+    fc3.metric("Carry", f"{rate-div_yield:+.2%}",
+                "Contango" if rate > div_yield else "Backwardation")
 
-        rec_col1, rec_col2 = st.columns(2)
+    mkt_fut = st.number_input("Market futures price (optional)", value=0.0,
+                                step=0.5, format="%.2f")
 
-        if have_options:
-            moneyness = strike / spot
-            days_to_expiry = int(tau * 365)
-            with rec_col1:
-                st.markdown("#### 📊 Options Verdict")
-                opt_verdict, opt_notes, opt_score = generate_options_recommendation(
-                    iv, g_vol if not np.isnan(g_vol) else e_vol, h_vol, trend, moneyness, days_to_expiry)
-                st.markdown(f"**{opt_verdict}**")
-                for n in opt_notes:
-                    st.markdown(f"- {n}")
-                log_recommendation(ticker_input, "options", opt_verdict, opt_score, spot)
-        else:
-            with rec_col1:
-                st.markdown("#### 📊 Options Verdict")
-                st.info("No options chain available for this ticker — can't generate an options-specific verdict.")
+    tenors = np.array([1,7,14,30,60,90,120,180,252])/252
+    fwds = [float(theoretical_forward_price(spot, rate, div_yield, float(t))) for t in tenors]
 
-        with rec_col2:
-            st.markdown("#### 📦 Futures Verdict")
-            fut_verdict, fut_notes, fut_score = generate_futures_recommendation(
-                spot, fwd, market_futures, rate, div_yield, trend, tau if tau else 30 / 365, ccy)
-            st.markdown(f"**{fut_verdict}**")
-            for n in fut_notes:
-                st.markdown(f"- {n}")
-            log_recommendation(ticker_input, "futures", fut_verdict, fut_score, spot)
+    fig_fc = go.Figure()
+    fig_fc.add_trace(go.Scatter(x=(tenors*252).astype(int).tolist(), y=fwds,
+                                  mode="lines+markers",
+                                  line=dict(color=PALETTE["primary"], width=3),
+                                  marker=dict(size=10, color=PALETTE["primary"],
+                                                line=dict(color="#0b0f1a", width=2)),
+                                  fill="tozeroy", fillcolor="rgba(99,102,241,0.1)"))
+    fig_fc.add_hline(y=float(spot), line_dash="dot", line_color=PALETTE["muted"],
+                      annotation_text=f"Spot {ccy}{spot:.2f}")
+    if mkt_fut > 0:
+        fig_fc.add_hline(y=float(mkt_fut), line_dash="dash", line_color=PALETTE["danger"],
+                          annotation_text=f"Market {ccy}{mkt_fut:.2f}")
+    fig_fc.update_xaxes(title="Days to Expiry")
+    fig_fc.update_yaxes(title=f"Forward Price ({ccy})")
+    apply_pro_style(fig_fc, "Cost-of-Carry Forward Curve", 380, show_legend=False)
+    st.plotly_chart(fig_fc, use_container_width=True)
 
-        st.info("⚠️ Both verdicts are transparent, rule-based heuristics for learning purposes — they show "
-                "exactly which inputs (vol gap, trend, carry, time decay, moneyness) drove the call. They "
-                "are **not** financial advice, don't account for your risk tolerance or portfolio, and "
-                "shouldn't be the sole basis for a real trade.")
+    ov, on_notes, _ = rec_options(iv, g_vol if not np.isnan(g_vol) else e_vol,
+                                     h_vol, trend, strike/spot, int(tau*365), pcr_oi)
+    fv_sig, fn_notes, _ = rec_futures(spot, fwd, mkt_fut, rate, div_yield, trend, tau, ccy)
 
-    # ---------------- FINAL REPORT (compiles results from every tab above) ----------------
-    st.markdown("---")
-    st.markdown("## 📄 Full Analysis Report")
-    st.caption("Compiles everything computed above — market snapshot, volatility estimates, pricing, "
-               "Greeks, hedge simulation, backtest stats, and both recommendations — into one downloadable "
-               "report. Visit the other tabs first so their results are included; anything not yet computed "
-               "shows as N/A.")
+    st.markdown("### Trading Signals")
+    fv1, fv2 = st.columns(2)
+    with fv1:
+        st.markdown(f"**📊 Options:** {ov}")
+        for n in on_notes:
+            st.markdown(f"- {n}")
+    with fv2:
+        st.markdown(f"**📦 Futures:** {fv_sig}")
+        for n in fn_notes:
+            st.markdown(f"- {n}")
 
-    report_text = generate_summary_report(
-        ticker_input, ccy, spot, rate, div_yield, source,
-        h_vol, e_vol, g_vol, iv, ml_vol, mf_iv,
-        have_options, expiry, strike, option_type, tau,
-        bsm_p, binom_p, mc_p, greeks1, greeks2,
-        heston_p, jump_p, hedge_pnl,
-        fwd, market_futures,
-        opt_verdict, opt_notes, fut_verdict, fut_notes,
-        bt_stats,
-    )
+elif section == "⚠️ Risk":
+    st.markdown('<div class="qe-section">⚠️ Value-at-Risk & Stress Testing</div>',
+                  unsafe_allow_html=True)
 
-    with st.expander("Preview report", expanded=False):
-        st.text(report_text)
+    if var_dict:
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric(f"Param VaR", f"{ccy}{var_dict['param_var']:,.0f}")
+        r2.metric(f"Param CVaR", f"{ccy}{var_dict['param_cvar']:,.0f}")
+        r3.metric(f"Hist VaR", f"{ccy}{var_dict['hist_var']:,.0f}")
+        r4.metric(f"Hist CVaR", f"{ccy}{var_dict['hist_cvar']:,.0f}")
 
-    st.download_button(
-        label="⬇️ Download Full Report (.txt)",
-        data=report_text,
-        file_name=f"optika_report_{ticker_input.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
-        mime="text/plain",
-    )
+    st.markdown("### Stress Test Scenarios")
+    sc_dict = stress_test(spot, strike, rate, div_yield, vol_fp, tau, greeks, option_type)
+    srows = [{"Scenario":k, "Approx P&L":round(v["approx_pnl"],4),
+                "Exact P&L":round(v["exact_pnl"],4)} for k,v in sc_dict.items()]
+    sdf = pd.DataFrame(srows)
 
-    st.markdown(
-        '<div class="optika-footer">◈ Optika — Derivatives Intelligence Engine · '
-        'Built with Python, Streamlit, SciPy &amp; scikit-learn · '
-        'Data: Yahoo Finance / NSE India / Stooq · Educational tool, not financial advice</div>',
-        unsafe_allow_html=True,
-    )
+    fig_st = go.Figure(go.Bar(
+        y=sdf["Scenario"], x=sdf["Exact P&L"], orientation="h",
+        marker=dict(color=[PALETTE["success"] if v > 0 else PALETTE["danger"]
+                            for v in sdf["Exact P&L"]],
+                     line=dict(color="#0b0f1a", width=1)),
+        text=[f"{ccy}{v:+.2f}" for v in sdf["Exact P&L"]], textposition="outside",
+    ))
+    fig_st.add_vline(x=0.0, line_color="#f1f5f9", line_dash="dash", opacity=0.5)
+    fig_st.update_xaxes(title=f"P&L ({ccy})")
+    apply_pro_style(fig_st, "Option P&L Under Stress Scenarios", 480, show_legend=False)
+    st.plotly_chart(fig_st, use_container_width=True)
+
+    st.dataframe(sdf, use_container_width=True, hide_index=True)
+
+elif section == "🔁 Backtest":
+    st.markdown('<div class="qe-section">🔁 Walk-Forward Backtest</div>', unsafe_allow_html=True)
+
+    bt_thr = st.slider("Vol threshold (%)", 5, 30, 15) / 100
+    with st.spinner("Running adaptive backtest..."):
+        btdf, note = walk_forward_backtest(hist, vol_threshold=bt_thr)
+
+    st.info(f"📊 {note}")
+
+    if btdf.empty:
+        st.warning("Insufficient data. Try a ticker with longer history.")
+    else:
+        st.dataframe(btdf.style.format({
+            "ewma_vol":"{:.2%}","hist_vol":"{:.2%}",
+            "realized_vol":"{:.2%}","approx_pnl":"{:.4f}"
+        }), use_container_width=True, hide_index=True)
+
+        ps = performance_stats(btdf["approx_pnl"])
+        if ps:
+            b1, b2, b3, b4, b5 = st.columns(5)
+            b1.metric("Sharpe", f"{ps.get('sharpe',0):.2f}"
+                       if not np.isnan(ps.get('sharpe',np.nan)) else "N/A")
+            b2.metric("Sortino", f"{ps.get('sortino',0):.2f}"
+                       if not np.isnan(ps.get('sortino',np.nan)) else "N/A")
+            b3.metric("Calmar", f"{ps.get('calmar',0):.2f}"
+                       if not np.isnan(ps.get('calmar',np.nan)) else "N/A")
+            b4.metric("Max DD", f"{ps.get('max_dd',0):.2%}")
+            pv = ps.get("p_value", np.nan)
+            b5.metric("Bootstrap p", f"{pv:.3f}" if not np.isnan(pv) else "N/A",
+                       "✅ Sig." if not np.isnan(pv) and pv < 0.05 else "❌ Not sig.")
+
+        fig_bt = go.Figure(go.Bar(
+            x=[f"W{int(r)}" for r in btdf["window"]],
+            y=btdf["approx_pnl"],
+            marker=dict(color=[PALETTE["success"] if v > 0 else PALETTE["danger"]
+                                 for v in btdf["approx_pnl"]],
+                         line=dict(color="#0b0f1a", width=1)),
+            text=[f"{v:+.4f}" for v in btdf["approx_pnl"]], textposition="outside"
+        ))
+        fig_bt.add_hline(y=0.0, line_color="#f1f5f9", line_dash="dash", opacity=0.5)
+        apply_pro_style(fig_bt, "Walk-Forward P&L by Window", 380, show_legend=False)
+        st.plotly_chart(fig_bt, use_container_width=True)
+
+        btdf["cum_pnl"] = btdf["approx_pnl"].cumsum()
+        fig_cum = go.Figure()
+        fig_cum.add_trace(go.Scatter(
+            x=btdf["window"], y=btdf["cum_pnl"], mode="lines+markers",
+            line=dict(color=PALETTE["primary"], width=3),
+            marker=dict(size=12, color=PALETTE["primary"],
+                         line=dict(color="#0b0f1a", width=2)),
+            fill="tozeroy", fillcolor="rgba(99,102,241,0.15)",
+        ))
+        fig_cum.add_hline(y=0.0, line_color="#f1f5f9", line_dash="dash", opacity=0.5)
+        apply_pro_style(fig_cum, "Cumulative Backtest P&L", 320, show_legend=False)
+        st.plotly_chart(fig_cum, use_container_width=True)
+
+elif section == "📋 Report":
+    st.markdown('<div class="qe-section">📋 Comprehensive Analysis Report</div>',
+                  unsafe_allow_html=True)
+
+    ov2, on_notes2, _ = rec_options(iv, g_vol if not np.isnan(g_vol) else e_vol,
+                                        h_vol, trend, strike/spot if spot else 1,
+                                        int(tau*365), pcr_oi)
+    fv2, fn_notes2, _ = rec_futures(spot, fwd, 0.0, rate, div_yield, trend, tau, ccy)
+
+    btdf2, _ = walk_forward_backtest(hist, vol_threshold=0.15)
+    ps2 = performance_stats(btdf2["approx_pnl"]) if not btdf2.empty else {}
+    sc_dict = stress_test(spot, strike, rate, div_yield, vol_fp, tau, greeks, option_type)
+
+    rd = {
+        "ticker": ticker_input, "ccy": ccy, "spot": spot,
+        "rate": rate, "div_yield": div_yield,
+        "strike": strike, "tau": tau, "option_type": option_type,
+        "data_source": f"{rt_src} | Options: {opt_src}",
+        "pos_val": pos_val, "var_conf": var_conf,
+        "volatility": {"hist":h_vol,"ewma":e_vol,"garch":g_vol,
+                         "xgb":x_vol,"iv":iv,"mfiv":mfiv},
+        "pricing": {"bsm":bsm_p,"binom":binom_p,"mc":mc_p,"mc_se":mc_err,
+                      "mc_paths":n_mc,
+                      "heston":heston_p if not np.isnan(heston_p) else 0,
+                      "merton":merton_p if not np.isnan(merton_p) else 0,
+                      "market":market_price if not np.isnan(market_price) else 0},
+        "greeks": greeks, "risk": var_dict,
+        "futures": {"theoretical":fwd,"carry":rate-div_yield},
+        "backtest": {"df":btdf2,"perf_stats":ps2},
+        "scenarios": sc_dict,
+        "pcr": pcr_oi,
+        "opt_verdict": ov2, "fut_verdict": fv2,
+        "opt_notes": on_notes2, "fut_notes": fn_notes2,
+    }
+    rpt = build_professional_report(rd)
+
+    st.download_button("⬇️ Download Full Report (Markdown)",
+                        data=rpt.encode("utf-8"),
+                        file_name=f"QUANT_EDGE_{ticker_input}_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
+                        mime="text/markdown", type="primary")
+
+    with st.expander("📄 View Report Preview", expanded=True):
+        st.markdown(rpt)
+
+    save_snapshot(ticker_input, spot, iv if not np.isnan(iv) else None,
+                   h_vol, e_vol, g_vol, rate, div_yield, ov2, fv2, rt_src)
+
+    st.info("⚠️ Educational tool only. Not financial advice.")
