@@ -1,4 +1,4 @@
-# ◈ Optika — Derivatives Intelligence Engine
+# ◈ quantedge — Derivatives Intelligence Engine
 
 ## Run it
 
